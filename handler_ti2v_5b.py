@@ -242,6 +242,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 input_prompt=prompt,
                 img=input_img,
                 size=(width, height),
+                max_area=width * height,
                 frame_num=num_frames,
                 shift=sample_shift,
                 sample_solver=sample_solver,

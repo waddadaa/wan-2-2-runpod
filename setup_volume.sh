@@ -11,9 +11,12 @@ echo "WAN 2.2 Network Volume Setup"
 echo "=========================================="
 
 # Configuration
+# Note: On pods this is /workspace, on serverless it's /runpod-volume
+# The Dockerfile creates a symlink so both work
 WORKSPACE="/workspace"
 MODELS_DIR="${WORKSPACE}/models"
 ENV_DIR="${WORKSPACE}/env"
+HF_CACHE="${WORKSPACE}/huggingface-cache"
 WAN_REPO="https://github.com/Wan-Video/Wan2.2.git"
 
 # Hugging Face model IDs
@@ -31,6 +34,7 @@ declare -A MODELS=(
 echo "[1/5] Creating directories..."
 mkdir -p "${MODELS_DIR}"
 mkdir -p "${ENV_DIR}"
+mkdir -p "${HF_CACHE}"
 
 # ==============================================================================
 # Setup Python virtual environment

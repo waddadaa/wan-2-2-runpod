@@ -21,36 +21,75 @@ import runpod
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Debug: Log what's in the filesystem
-logger.info("=" * 60)
-logger.info("DEBUG: Checking filesystem...")
-logger.info(f"Root contents: {os.listdir('/')}")
-if os.path.exists('/workspace'):
-    logger.info(f"/workspace exists: {os.listdir('/workspace')}")
-    if os.path.exists('/workspace/Wan2.2'):
-        logger.info(f"/workspace/Wan2.2 exists: {os.listdir('/workspace/Wan2.2')}")
-    else:
-        logger.info("/workspace/Wan2.2 does NOT exist!")
-else:
-    logger.info("/workspace does NOT exist!")
-if os.path.exists('/runpod-volume'):
-    logger.info(f"/runpod-volume exists: {os.listdir('/runpod-volume')}")
-logger.info("=" * 60)
-
-# Add WAN 2.2 to path (from network volume)
-sys.path.insert(0, "/workspace/Wan2.2")
+# Add WAN 2.2 to path (baked into Docker image)
+sys.path.insert(0, "/app/Wan2.2")
 
 MODEL = None
 
+# Model configuration
+MODEL_NAME = "Wan2.2-S2V-14B"
+HF_REPO_ID = "Wan-AI/Wan2.2-S2V-14B"
+WAN_CONFIG_KEY = "s2v-14B"
+
+
+def ensure_model_downloaded(model_dir: str, model_name: str, hf_repo_id: str) -> str:
+    """
+    Check if model exists, download from HuggingFace if not.
+    Returns the path to the model directory.
+    """
+    ckpt_dir = os.path.join(model_dir, model_name)
+
+    # Check if model already exists (look for key files)
+    if os.path.exists(ckpt_dir):
+        # Check for typical model files
+        has_files = any(
+            os.path.exists(os.path.join(ckpt_dir, f))
+            for f in ["config.json", "model_index.json", "diffusion_pytorch_model.safetensors"]
+        )
+        if has_files or len(os.listdir(ckpt_dir)) > 0:
+            logger.info(f"Model found at {ckpt_dir}")
+            return ckpt_dir
+
+    # Model not found, download from HuggingFace
+    logger.info("=" * 60)
+    logger.info(f"Model not found at {ckpt_dir}")
+    logger.info(f"Downloading {model_name} from HuggingFace...")
+    logger.info(f"Repo: {hf_repo_id}")
+    logger.info("This may take a while (~43GB download)")
+    logger.info("=" * 60)
+
+    try:
+        from huggingface_hub import snapshot_download
+
+        # Ensure model directory exists
+        os.makedirs(model_dir, exist_ok=True)
+
+        # Download the model
+        snapshot_download(
+            repo_id=hf_repo_id,
+            local_dir=ckpt_dir,
+            local_dir_use_symlinks=False,
+            resume_download=True,
+        )
+
+        logger.info(f"Model downloaded successfully to {ckpt_dir}")
+        return ckpt_dir
+
+    except Exception as e:
+        logger.error(f"Failed to download model: {e}")
+        raise RuntimeError(f"Failed to download model from {hf_repo_id}: {e}")
+
 
 def load_model():
-    """Load the S2V model from network volume."""
+    """Load the S2V model, downloading from HuggingFace if needed."""
     global MODEL
     if MODEL is not None:
         return MODEL
 
-    model_dir = os.environ.get("MODEL_DIR", "/workspace/models")
-    ckpt_dir = os.path.join(model_dir, "Wan2.2-S2V-14B")
+    model_dir = os.environ.get("MODEL_DIR", "/runpod-volume/models")
+
+    # Ensure model is downloaded
+    ckpt_dir = ensure_model_downloaded(model_dir, MODEL_NAME, HF_REPO_ID)
 
     logger.info("=" * 60)
     logger.info("Loading WAN 2.2 S2V model...")
@@ -64,7 +103,7 @@ def load_model():
         import wan
         from wan.configs import WAN_CONFIGS
 
-        cfg = WAN_CONFIGS["s2v-14B"]
+        cfg = WAN_CONFIGS[WAN_CONFIG_KEY]
 
         MODEL = wan.WanS2V(
             config=cfg,

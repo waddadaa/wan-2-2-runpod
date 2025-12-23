@@ -21,19 +21,55 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Add WAN 2.2 to path
-sys.path.insert(0, "/workspace/Wan2.2")
+sys.path.insert(0, "/app/Wan2.2")
 
 MODEL = None
 
+# Model configuration
+MODEL_NAME = "Wan2.2-T2V-A14B"
+HF_REPO_ID = "Wan-AI/Wan2.2-T2V-A14B"
+WAN_CONFIG_KEY = "t2v-A14B"
+
+
+def ensure_model_downloaded(model_dir: str, model_name: str, hf_repo_id: str) -> str:
+    """Check if model exists, download from HuggingFace if not."""
+    ckpt_dir = os.path.join(model_dir, model_name)
+
+    if os.path.exists(ckpt_dir) and len(os.listdir(ckpt_dir)) > 0:
+        logger.info(f"Model found at {ckpt_dir}")
+        return ckpt_dir
+
+    logger.info("=" * 60)
+    logger.info(f"Model not found at {ckpt_dir}")
+    logger.info(f"Downloading {model_name} from HuggingFace...")
+    logger.info(f"Repo: {hf_repo_id}")
+    logger.info("This may take a while (~50GB download)")
+    logger.info("=" * 60)
+
+    try:
+        from huggingface_hub import snapshot_download
+        os.makedirs(model_dir, exist_ok=True)
+        snapshot_download(
+            repo_id=hf_repo_id,
+            local_dir=ckpt_dir,
+            local_dir_use_symlinks=False,
+            resume_download=True,
+        )
+        logger.info(f"Model downloaded successfully to {ckpt_dir}")
+        return ckpt_dir
+    except Exception as e:
+        logger.error(f"Failed to download model: {e}")
+        raise RuntimeError(f"Failed to download model from {hf_repo_id}: {e}")
+
 
 def load_model():
-    """Load T2V-14B model from network volume."""
+    """Load T2V-14B model, downloading from HuggingFace if needed."""
     global MODEL
     if MODEL is not None:
         return MODEL
 
-    model_dir = os.environ.get("MODEL_DIR", "/workspace/models")
-    ckpt_dir = os.path.join(model_dir, "Wan2.2-T2V-A14B")
+    model_dir = os.environ.get("MODEL_DIR", "/runpod-volume/models")
+    ckpt_dir = ensure_model_downloaded(model_dir, MODEL_NAME, HF_REPO_ID)
 
     logger.info("=" * 60)
     logger.info("Loading WAN 2.2 T2V-A14B model...")
@@ -47,7 +83,7 @@ def load_model():
         import wan
         from wan.configs import WAN_CONFIGS
 
-        cfg = WAN_CONFIGS["t2v-A14B"]
+        cfg = WAN_CONFIGS[WAN_CONFIG_KEY]
 
         MODEL = wan.WanT2V(
             config=cfg,

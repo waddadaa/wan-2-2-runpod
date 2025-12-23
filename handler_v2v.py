@@ -73,9 +73,10 @@ PREPROCESS_MODELS = {
         "subdir": "det"
     },
     "pose2d": {
-        "filename": "vitpose-h-wholebody.onnx",
-        # JunkyByte/easy_ViTPose has the single-file ONNX model (no auth required)
-        "url": "https://huggingface.co/JunkyByte/easy_ViTPose/resolve/main/onnx/wholebody/vitpose-h-wholebody.onnx",
+        # Using vitpose-l (large) - self-contained 1.23GB file
+        # Note: vitpose-h (huge) has external data files, vitpose-l is self-contained
+        "filename": "vitpose-l-wholebody.onnx",
+        "url": "https://huggingface.co/JunkyByte/easy_ViTPose/resolve/main/onnx/wholebody/vitpose-l-wholebody.onnx",
         "subdir": "pose2d"
     }
 }
@@ -129,13 +130,28 @@ def download_file(url: str, dest_path: str) -> bool:
 
 def ensure_preprocess_models(preprocess_dir: str) -> bool:
     """Ensure preprocessing models are downloaded."""
+    # Minimum expected sizes (to detect incomplete/corrupt downloads)
+    MIN_SIZES = {
+        "det": 50 * 1024 * 1024,      # YOLOv10m should be ~62MB
+        "pose2d": 1000 * 1024 * 1024,  # ViTPose-L should be ~1.23GB
+    }
+
     all_present = True
 
     for model_key, model_info in PREPROCESS_MODELS.items():
         model_path = os.path.join(preprocess_dir, model_info["subdir"], model_info["filename"])
+        min_size = MIN_SIZES.get(model_key, 0)
 
         if os.path.exists(model_path):
-            logger.info(f"Preprocess model found: {model_path}")
+            file_size = os.path.getsize(model_path)
+            if file_size >= min_size:
+                logger.info(f"Preprocess model found: {model_path} ({file_size / (1024*1024):.1f} MB)")
+            else:
+                # File too small - likely corrupt or incomplete
+                logger.warning(f"Model file too small ({file_size} bytes), re-downloading: {model_path}")
+                os.remove(model_path)
+                if not download_file(model_info["url"], model_path):
+                    all_present = False
         else:
             logger.info(f"Preprocess model not found: {model_path}")
             if not download_file(model_info["url"], model_path):
@@ -188,7 +204,7 @@ def load_preprocess_pipeline():
         raise RuntimeError("Failed to download preprocessing models")
 
     det_path = os.path.join(preprocess_dir, "det", "yolov10m.onnx")
-    pose2d_path = os.path.join(preprocess_dir, "pose2d", "vitpose-h-wholebody.onnx")
+    pose2d_path = os.path.join(preprocess_dir, "pose2d", "vitpose-l-wholebody.onnx")
 
     logger.info("Loading preprocessing pipeline...")
     logger.info(f"  Detection model: {det_path}")

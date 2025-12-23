@@ -21,6 +21,22 @@ import runpod
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Debug: Log what's in the filesystem
+logger.info("=" * 60)
+logger.info("DEBUG: Checking filesystem...")
+logger.info(f"Root contents: {os.listdir('/')}")
+if os.path.exists('/workspace'):
+    logger.info(f"/workspace exists: {os.listdir('/workspace')}")
+    if os.path.exists('/workspace/Wan2.2'):
+        logger.info(f"/workspace/Wan2.2 exists: {os.listdir('/workspace/Wan2.2')}")
+    else:
+        logger.info("/workspace/Wan2.2 does NOT exist!")
+else:
+    logger.info("/workspace does NOT exist!")
+if os.path.exists('/runpod-volume'):
+    logger.info(f"/runpod-volume exists: {os.listdir('/runpod-volume')}")
+logger.info("=" * 60)
+
 # Add WAN 2.2 to path (from network volume)
 sys.path.insert(0, "/workspace/Wan2.2")
 

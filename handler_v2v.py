@@ -54,15 +54,18 @@ HF_REPO_ID = "Wan-AI/Wan2.2-Animate-14B"
 WAN_CONFIG_KEY = "animate-14B"
 
 # Preprocessing model URLs (HuggingFace)
+# Note: Using public repos that don't require authentication
 PREPROCESS_MODELS = {
     "det": {
         "filename": "yolov10m.onnx",
+        # onnx-community repo has the file at onnx/model.onnx
         "url": "https://huggingface.co/onnx-community/yolov10m/resolve/main/onnx/model.onnx",
         "subdir": "det"
     },
     "pose2d": {
-        "filename": "vitpose_h_wholebody.onnx",
-        "url": "https://huggingface.co/wanghaofan/Sonic/resolve/main/vitpose-h-wholebody.onnx",
+        "filename": "vitpose-h-wholebody.onnx",
+        # JunkyByte/easy_ViTPose has the single-file ONNX model (no auth required)
+        "url": "https://huggingface.co/JunkyByte/easy_ViTPose/resolve/main/onnx/wholebody/vitpose-h-wholebody.onnx",
         "subdir": "pose2d"
     }
 }
@@ -72,13 +75,45 @@ def download_file(url: str, dest_path: str) -> bool:
     """Download a file from URL to destination path."""
     import urllib.request
     try:
-        logger.info(f"Downloading {url} to {dest_path}")
+        logger.info(f"Downloading {url}")
+        logger.info(f"  -> {dest_path}")
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-        urllib.request.urlretrieve(url, dest_path)
-        logger.info(f"Downloaded successfully: {dest_path}")
-        return True
+
+        # Create request with user-agent header (some sites block requests without it)
+        request = urllib.request.Request(
+            url,
+            headers={'User-Agent': 'Mozilla/5.0 (compatible; RunPod/1.0)'}
+        )
+
+        # Download with progress
+        with urllib.request.urlopen(request, timeout=300) as response:
+            total_size = response.headers.get('Content-Length')
+            if total_size:
+                total_size = int(total_size)
+                logger.info(f"  Size: {total_size / (1024*1024):.1f} MB")
+
+            with open(dest_path, 'wb') as f:
+                downloaded = 0
+                block_size = 8192
+                while True:
+                    chunk = response.read(block_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+
+        # Verify download
+        if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+            logger.info(f"Downloaded successfully: {dest_path}")
+            return True
+        else:
+            logger.error(f"Download resulted in empty file: {dest_path}")
+            return False
+
     except Exception as e:
         logger.error(f"Failed to download {url}: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
@@ -143,7 +178,7 @@ def load_preprocess_pipeline():
         raise RuntimeError("Failed to download preprocessing models")
 
     det_path = os.path.join(preprocess_dir, "det", "yolov10m.onnx")
-    pose2d_path = os.path.join(preprocess_dir, "pose2d", "vitpose_h_wholebody.onnx")
+    pose2d_path = os.path.join(preprocess_dir, "pose2d", "vitpose-h-wholebody.onnx")
 
     logger.info("Loading preprocessing pipeline...")
     logger.info(f"  Detection model: {det_path}")

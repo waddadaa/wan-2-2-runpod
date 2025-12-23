@@ -1,0 +1,31 @@
+# Test files
+test_*.py
+
+# Output files
+output_*.mp4
+
+# Logs
+log*.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.so
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Reference repo (if cloned)
+wan2.2-reference/

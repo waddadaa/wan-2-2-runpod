@@ -22,23 +22,24 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Fix safetensors "device cuda:0 is invalid" error
-# Monkey-patch to convert string device to integer
+# The safetensors Rust backend has a bug with CUDA device strings
+# Workaround: Load checkpoint to CPU RAM first, then model moves tensors to GPU
+# This is safe - only checkpoint I/O uses CPU, model runs on GPU
 import safetensors.torch
 _original_load_file = safetensors.torch.load_file
 
 def _patched_load_file(filename, device="cpu"):
-    # Convert "cuda:0" -> 0, "cuda:1" -> 1, etc.
-    if isinstance(device, str) and device.startswith("cuda:"):
-        try:
-            device = int(device.split(":")[1])
-        except (ValueError, IndexError):
-            device = 0
-    elif device == "cuda":
-        device = 0
-    return _original_load_file(filename, device=device)
+    # Force CPU load to avoid safetensors Rust CUDA bug
+    # The model's .to(device) will move tensors to GPU after loading
+    result = _original_load_file(filename, device="cpu")
+    # If originally requested GPU, move tensors to GPU now
+    if device != "cpu" and torch.cuda.is_available():
+        target = torch.device("cuda:0")
+        result = {k: v.to(target) for k, v in result.items()}
+    return result
 
 safetensors.torch.load_file = _patched_load_file
-logger.info("Patched safetensors.torch.load_file for CUDA device compatibility")
+logger.info("Patched safetensors to load via CPU (workaround for Rust CUDA bug)")
 
 # Add WAN 2.2 to path (baked into Docker image)
 sys.path.insert(0, "/app/Wan2.2")

@@ -22,22 +22,19 @@ import runpod
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Fix safetensors "device cuda:0 is invalid" error
+# Fix safetensors "device cuda:0 is invalid" error (Rust CUDA bug workaround)
 import safetensors.torch
 _original_load_file = safetensors.torch.load_file
 
 def _patched_load_file(filename, device="cpu"):
-    if isinstance(device, str) and device.startswith("cuda:"):
-        try:
-            device = int(device.split(":")[1])
-        except (ValueError, IndexError):
-            device = 0
-    elif device == "cuda":
-        device = 0
-    return _original_load_file(filename, device=device)
+    result = _original_load_file(filename, device="cpu")
+    if device != "cpu" and torch.cuda.is_available():
+        target = torch.device("cuda:0")
+        result = {k: v.to(target) for k, v in result.items()}
+    return result
 
 safetensors.torch.load_file = _patched_load_file
-logger.info("Patched safetensors.torch.load_file for CUDA device compatibility")
+logger.info("Patched safetensors to load via CPU")
 
 # Add WAN 2.2 to path
 sys.path.insert(0, "/app/Wan2.2")

@@ -86,6 +86,14 @@ def load_model():
     if MODEL is not None:
         return MODEL
 
+    # Initialize CUDA before loading model
+    if torch.cuda.is_available():
+        torch.cuda.init()
+        torch.cuda.set_device(0)
+        # Warm up CUDA
+        _ = torch.zeros(1).cuda()
+        logger.info(f"CUDA initialized: {torch.cuda.get_device_name(0)}")
+
     model_dir = os.environ.get("MODEL_DIR", "/runpod-volume/models")
 
     # Ensure model is downloaded

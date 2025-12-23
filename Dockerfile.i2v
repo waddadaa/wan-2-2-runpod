@@ -15,7 +15,10 @@ ENV PYTHONUNBUFFERED=1 \
     MODEL_DIR=/runpod-volume/models \
     HF_HOME=/runpod-volume/huggingface-cache \
     TRANSFORMERS_CACHE=/runpod-volume/huggingface-cache \
-    PYTHONPATH="/app/Wan2.2:$PYTHONPATH"
+    PYTHONPATH="/app/Wan2.2:$PYTHONPATH" \
+    CUDA_VISIBLE_DEVICES=0 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    CUDA_DEVICE_ORDER=PCI_BUS_ID
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \

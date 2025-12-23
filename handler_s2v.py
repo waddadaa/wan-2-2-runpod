@@ -21,6 +21,25 @@ import runpod
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Fix safetensors "device cuda:0 is invalid" error
+# Monkey-patch to convert string device to integer
+import safetensors.torch
+_original_load_file = safetensors.torch.load_file
+
+def _patched_load_file(filename, device="cpu"):
+    # Convert "cuda:0" -> 0, "cuda:1" -> 1, etc.
+    if isinstance(device, str) and device.startswith("cuda:"):
+        try:
+            device = int(device.split(":")[1])
+        except (ValueError, IndexError):
+            device = 0
+    elif device == "cuda":
+        device = 0
+    return _original_load_file(filename, device=device)
+
+safetensors.torch.load_file = _patched_load_file
+logger.info("Patched safetensors.torch.load_file for CUDA device compatibility")
+
 # Add WAN 2.2 to path (baked into Docker image)
 sys.path.insert(0, "/app/Wan2.2")
 

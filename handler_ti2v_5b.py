@@ -165,11 +165,15 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     """
     WAN 2.2 TI2V-5B Handler (Text + Image to Video)
 
+    Supports TWO modes:
+        - T2V (Text-to-Video): prompt only, no image
+        - I2V (Image-to-Video): prompt + image
+
     Required:
         prompt (str): Text description of the video
-        image (str): Base64 encoded input image
 
     Optional:
+        image (str): Base64 encoded input image (if provided, runs I2V mode)
         negative_prompt (str): What to avoid
         size (str): Resolution "WIDTHxHEIGHT" (default: 832x480)
         num_frames (int): Frame count, must be 4n+1 (default: 81)
@@ -186,12 +190,11 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         if not prompt:
             return {"error": "prompt is required"}
 
+        # Image is OPTIONAL - if provided, runs I2V mode; if not, runs T2V mode
         image_data = job_input.get("image", "")
-        if not image_data:
-            return {"error": "image is required (base64 encoded)"}
-
-        image_bytes = decode_base64_image(image_data)
-        image_path = save_temp_file(image_bytes, ".png")
+        if image_data:
+            image_bytes = decode_base64_image(image_data)
+            image_path = save_temp_file(image_bytes, ".png")
 
         negative_prompt = job_input.get(
             "negative_prompt",
@@ -226,10 +229,18 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
         max_area = width * height
 
+        # Load image if provided (I2V mode), otherwise None (T2V mode)
+        input_img = None
+        if image_path:
+            input_img = Image.open(image_path).convert('RGB')
+            logger.info("Mode: Image-to-Video (I2V)")
+        else:
+            logger.info("Mode: Text-to-Video (T2V)")
+
         with torch.inference_mode():
             video_tensor = wan_ti2v.generate(
                 input_prompt=prompt,
-                input_image=image_path,
+                img=input_img,
                 size=(width, height),
                 frame_num=num_frames,
                 shift=sample_shift,
@@ -258,7 +269,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             "num_frames": num_frames,
             "fps": fps,
             "seed": seed,
-            "model": "Wan2.2-TI2V-5B"
+            "model": "Wan2.2-TI2V-5B",
+            "mode": "I2V" if input_img else "T2V"
         }
 
     except torch.cuda.OutOfMemoryError as e:

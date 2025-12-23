@@ -42,6 +42,16 @@ def _patched_load_file(filename, device="cpu"):
 safetensors.torch.load_file = _patched_load_file
 logger.info("Patched safetensors to load via CPU")
 
+# Mock FluxKontextPipeline - we don't use FLUX mode but the import happens at module load
+# FluxKontextPipeline requires diffusers 0.35.0+ which we don't have
+import diffusers
+if not hasattr(diffusers, 'FluxKontextPipeline'):
+    class _MockFluxKontextPipeline:
+        """Mock class - FLUX mode not supported in this deployment"""
+        pass
+    diffusers.FluxKontextPipeline = _MockFluxKontextPipeline
+    logger.info("Mocked FluxKontextPipeline (FLUX mode not available)")
+
 sys.path.insert(0, "/app/Wan2.2")
 sys.path.insert(0, "/app/Wan2.2/wan/modules/animate/preprocess")
 

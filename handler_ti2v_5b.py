@@ -248,7 +248,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 sampling_steps=sample_steps,
                 guide_scale=guidance_scale,
                 seed=seed,
-                offload_model=True,
+                offload_model=False,  # 80GB VRAM - no offloading needed
             )
 
         from wan.utils.utils import save_video

@@ -175,7 +175,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     Optional:
         image (str): Base64 encoded input image (if provided, runs I2V mode)
         negative_prompt (str): What to avoid
-        size (str): Resolution "WIDTHxHEIGHT" (default: 832x480)
+        size (str): Resolution "WIDTHxHEIGHT" (default: 1280x704 for 720P)
         num_frames (int): Frame count, must be 4n+1 (default: 81)
         sample_steps (int): Denoising steps (default: 50)
         guidance_scale (float): CFG scale (default: 5.0)
@@ -201,7 +201,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             "poor quality, blurred, distorted, watermark, low resolution"
         )
 
-        size = job_input.get("size", "832x480")
+        size = job_input.get("size", "1280x704")  # TI2V-5B uses 1280x704 for 720P
         width, height = parse_resolution(size)
 
         num_frames = job_input.get("num_frames", job_input.get("frame_num", 81))

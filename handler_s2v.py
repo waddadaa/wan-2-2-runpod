@@ -431,12 +431,21 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         # Calculate max_area from resolution
         max_area = width * height
 
+        # TTS parameters - required positional args even when enable_tts=False
+        # If TTS mode was used, audio was already generated above
+        tts_prompt_audio_for_gen = None
+        tts_prompt_text_for_gen = None
+        tts_text_for_gen = None
+
         # Build generate kwargs
         generate_kwargs = {
             "input_prompt": prompt,
             "ref_image_path": image_path,
             "audio_path": audio_path,
-            "enable_tts": False,  # TTS already handled above
+            "enable_tts": False,  # TTS already handled above if needed
+            "tts_prompt_audio": tts_prompt_audio_for_gen,
+            "tts_prompt_text": tts_prompt_text_for_gen,
+            "tts_text": tts_text_for_gen,
             "num_repeat": num_clip,
             "max_area": max_area,
             "shift": sample_shift,

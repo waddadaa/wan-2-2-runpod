@@ -1,14 +1,21 @@
 """
-WAN 2.2 Video-to-Video / Animate Handler for RunPod Serverless
+WAN 2.2 Animate Handler for RunPod Serverless
 Model: Wan2.2-Animate-14B
+Mode: Animation (motion transfer from driving video to reference image)
 License: Apache 2.0 (Commercial use allowed)
 
-ALL PARAMETERS EXPOSED
+INPUT:
+  - reference_image: Base64 encoded image (the person/character appearance)
+  - driving_video: Base64 encoded video (the motion to transfer)
+
+OUTPUT:
+  - Video of reference_image animated with driving_video's motion
 """
 
 import os
 import sys
 import gc
+import shutil
 import torch
 import base64
 import tempfile
@@ -36,13 +43,60 @@ safetensors.torch.load_file = _patched_load_file
 logger.info("Patched safetensors to load via CPU")
 
 sys.path.insert(0, "/app/Wan2.2")
+sys.path.insert(0, "/app/Wan2.2/wan/modules/animate/preprocess")
 
 MODEL = None
+PREPROCESS_PIPELINE = None
 
 # Model configuration
 MODEL_NAME = "Wan2.2-Animate-14B"
 HF_REPO_ID = "Wan-AI/Wan2.2-Animate-14B"
 WAN_CONFIG_KEY = "animate-14B"
+
+# Preprocessing model URLs (HuggingFace)
+PREPROCESS_MODELS = {
+    "det": {
+        "filename": "yolov10m.onnx",
+        "url": "https://huggingface.co/onnx-community/yolov10m/resolve/main/onnx/model.onnx",
+        "subdir": "det"
+    },
+    "pose2d": {
+        "filename": "vitpose_h_wholebody.onnx",
+        "url": "https://huggingface.co/wanghaofan/Sonic/resolve/main/vitpose-h-wholebody.onnx",
+        "subdir": "pose2d"
+    }
+}
+
+
+def download_file(url: str, dest_path: str) -> bool:
+    """Download a file from URL to destination path."""
+    import urllib.request
+    try:
+        logger.info(f"Downloading {url} to {dest_path}")
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        urllib.request.urlretrieve(url, dest_path)
+        logger.info(f"Downloaded successfully: {dest_path}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to download {url}: {e}")
+        return False
+
+
+def ensure_preprocess_models(preprocess_dir: str) -> bool:
+    """Ensure preprocessing models are downloaded."""
+    all_present = True
+
+    for model_key, model_info in PREPROCESS_MODELS.items():
+        model_path = os.path.join(preprocess_dir, model_info["subdir"], model_info["filename"])
+
+        if os.path.exists(model_path):
+            logger.info(f"Preprocess model found: {model_path}")
+        else:
+            logger.info(f"Preprocess model not found: {model_path}")
+            if not download_file(model_info["url"], model_path):
+                all_present = False
+
+    return all_present
 
 
 def ensure_model_downloaded(model_dir: str, model_name: str, hf_repo_id: str) -> str:
@@ -74,6 +128,40 @@ def ensure_model_downloaded(model_dir: str, model_name: str, hf_repo_id: str) ->
     except Exception as e:
         logger.error(f"Failed to download model: {e}")
         raise RuntimeError(f"Failed to download model from {hf_repo_id}: {e}")
+
+
+def load_preprocess_pipeline():
+    """Load the preprocessing pipeline for pose extraction."""
+    global PREPROCESS_PIPELINE
+    if PREPROCESS_PIPELINE is not None:
+        return PREPROCESS_PIPELINE
+
+    preprocess_dir = os.environ.get("PREPROCESS_MODEL_DIR", "/runpod-volume/models/preprocess")
+
+    # Ensure models are downloaded
+    if not ensure_preprocess_models(preprocess_dir):
+        raise RuntimeError("Failed to download preprocessing models")
+
+    det_path = os.path.join(preprocess_dir, "det", "yolov10m.onnx")
+    pose2d_path = os.path.join(preprocess_dir, "pose2d", "vitpose_h_wholebody.onnx")
+
+    logger.info("Loading preprocessing pipeline...")
+    logger.info(f"  Detection model: {det_path}")
+    logger.info(f"  Pose model: {pose2d_path}")
+
+    try:
+        from process_pipepline import ProcessPipeline
+        PREPROCESS_PIPELINE = ProcessPipeline(
+            det_checkpoint_path=det_path,
+            pose2d_checkpoint_path=pose2d_path,
+            sam_checkpoint_path=None,  # Not needed for animation mode
+            flux_kontext_path=None     # Not needed for basic animation
+        )
+        logger.info("Preprocessing pipeline loaded successfully!")
+        return PREPROCESS_PIPELINE
+    except Exception as e:
+        logger.error(f"Failed to load preprocessing pipeline: {e}")
+        raise
 
 
 def load_model():
@@ -115,6 +203,7 @@ def load_model():
             dit_fsdp=False,
             use_sp=False,
             t5_cpu=False,
+            use_relighting_lora=True,  # Always enabled for better lighting quality
         )
         logger.info("Animate model loaded successfully!")
         logger.info("=" * 60)
@@ -141,109 +230,130 @@ def save_temp_file(data: bytes, suffix: str) -> str:
         return f.name
 
 
-def parse_resolution(size: str) -> tuple:
-    if not size:
-        return (1280, 720)
-    if "*" in size:
-        parts = size.split("*")
-    elif "x" in size.lower():
-        parts = size.lower().split("x")
-    else:
-        return (1280, 720)
-    return (int(parts[0]), int(parts[1]))
-
-
 def cleanup():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
 
+def run_preprocessing(video_path: str, reference_image_path: str, output_dir: str,
+                      resolution: tuple = (1280, 720), fps: int = 30,
+                      retarget_flag: bool = False) -> bool:
+    """
+    Run preprocessing to extract pose and face data from driving video.
+
+    Creates:
+      - src_pose.mp4: Skeleton pose video
+      - src_face.mp4: Cropped face video (512x512)
+      - src_ref.png: Reference image (copied)
+
+    Args:
+        retarget_flag: Enable pose retargeting to handle different body proportions
+                       between reference image and driving video. Works best when both
+                       characters are in front-facing poses.
+    """
+    pipeline = load_preprocess_pipeline()
+
+    logger.info(f"Running preprocessing...")
+    logger.info(f"  Video: {video_path}")
+    logger.info(f"  Reference: {reference_image_path}")
+    logger.info(f"  Output: {output_dir}")
+    logger.info(f"  Resolution: {resolution}")
+    logger.info(f"  FPS: {fps}")
+    logger.info(f"  Retarget: {retarget_flag}")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        result = pipeline(
+            video_path=video_path,
+            refer_image_path=reference_image_path,
+            output_path=output_dir,
+            resolution_area=list(resolution),
+            fps=fps,
+            replace_flag=False,  # Animation mode, not replacement
+            retarget_flag=retarget_flag,  # Pose retargeting for different body proportions
+            use_flux=False       # No FLUX editing
+        )
+
+        # Verify output files exist
+        required_files = ["src_pose.mp4", "src_face.mp4", "src_ref.png"]
+        for f in required_files:
+            fpath = os.path.join(output_dir, f)
+            if not os.path.exists(fpath):
+                raise RuntimeError(f"Preprocessing failed to create: {f}")
+
+        logger.info("Preprocessing completed successfully!")
+        return True
+    except Exception as e:
+        logger.error(f"Preprocessing failed: {e}")
+        raise
+
+
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     """
-    WAN 2.2 Video-to-Video / Animate Handler - ALL PARAMETERS
+    WAN 2.2 Animate Handler - Animation Mode
+
+    Transfers motion from a driving video to a reference image.
 
     ═══════════════════════════════════════════════════════════════════════════
     REQUIRED PARAMETERS
     ═══════════════════════════════════════════════════════════════════════════
 
-    video (str):
-        Base64 encoded source video.
-        Supports MP4, MOV, AVI formats.
-        Motion from this video drives the output.
-
-    ═══════════════════════════════════════════════════════════════════════════
-    CHARACTER REFERENCE (Optional but recommended)
-    ═══════════════════════════════════════════════════════════════════════════
-
-    reference_image (str, optional):
-        Base64 encoded reference image for character replacement.
-        Character appearance from this image replaces source video character.
+    reference_image (str):
+        Base64 encoded reference image.
+        This is the person/character whose appearance will be used.
         Supports PNG, JPG, WEBP.
 
+    driving_video (str):
+        Base64 encoded driving video.
+        Motion from this video will be transferred to the reference image.
+        Supports MP4, MOV, AVI.
+
     ═══════════════════════════════════════════════════════════════════════════
-    GENERATION PARAMETERS
+    OPTIONAL PARAMETERS
     ═══════════════════════════════════════════════════════════════════════════
 
     prompt (str, default: ""):
-        Text description of desired output.
-        Example: "A woman with blonde hair dancing gracefully"
+        Text description (optional, minimal effect).
 
-    negative_prompt (str, default: "..."):
-        What to avoid in generation.
+    resolution (list, default: [1280, 720]):
+        Output resolution [width, height].
 
-    size (str, default: "1280x720"):
-        Output resolution. Format: "WIDTHxHEIGHT"
+    fps (int, default: 30):
+        Frames per second for processing and output.
 
-    num_frames / frame_num (int, default: 81):
-        Output frames. Must be 4n+1 format.
-
-    ═══════════════════════════════════════════════════════════════════════════
-    SAMPLING PARAMETERS
-    ═══════════════════════════════════════════════════════════════════════════
-
-    sample_steps / num_inference_steps (int, default: 50):
-        Denoising steps.
-
-    sample_guide_scale / guidance_scale (float, default: 5.0):
-        CFG scale.
-
-    sample_shift / flow_shift (float, default: 5.0):
-        Flow matching shift.
-
-    sample_solver (str, default: "unipc"):
-        Solver: "unipc" or "dpm++"
-
-    ═══════════════════════════════════════════════════════════════════════════
-    ANIMATE-SPECIFIC PARAMETERS
-    ═══════════════════════════════════════════════════════════════════════════
+    clip_len (int, default: 77):
+        Frames per generation clip. Must be 4n+1 format.
+        Higher = more temporal consistency, more VRAM.
 
     refert_num (int, default: 1):
-        Number of temporal guidance reference frames.
-        Options: 1 or 5
-        5 gives better temporal consistency but slower.
+        Temporal guidance frames. Options: 1 or 5.
+        5 = better consistency, slower.
 
-    replace_flag (bool, default: false):
-        Enable character replacement mode.
-        When true, reference_image character replaces source video character.
+    sampling_steps (int, default: 20):
+        Diffusion denoising steps. Higher = better quality, slower.
 
-    use_relighting_lora (bool, default: false):
-        Enable relighting enhancement LoRA.
-        Improves lighting consistency.
+    guide_scale (float, default: 1.0):
+        CFG scale. Usually keep at 1.0 for animate.
 
-    pose_video (str, optional):
-        Base64 encoded DW-pose sequence video.
-        For explicit pose control.
+    shift (float, default: 5.0):
+        Flow matching shift parameter.
 
-    ═══════════════════════════════════════════════════════════════════════════
-    OUTPUT PARAMETERS
-    ═══════════════════════════════════════════════════════════════════════════
+    sample_solver (str, default: "dpm++"):
+        Solver: "dpm++" or "unipc"
 
-    seed / base_seed (int, default: random):
-        Random seed.
+    seed (int, default: random):
+        Random seed for reproducibility.
 
-    fps (int, default: 16):
-        Output FPS.
+    offload_model (bool, default: True):
+        Offload model to CPU after forward pass to save VRAM.
+
+    retarget_flag (bool, default: False):
+        Enable pose retargeting to handle different body proportions
+        between reference image and driving video.
+        Recommended when character sizes/proportions differ significantly.
+        Works best when both characters are in front-facing poses.
 
     ═══════════════════════════════════════════════════════════════════════════
     RESPONSE FORMAT
@@ -252,160 +362,180 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     {
         "video": "<base64_mp4>",
         "format": "mp4",
-        "width": 1280,
-        "height": 720,
-        "num_frames": 81,
-        "fps": 16,
+        "resolution": [1280, 720],
+        "fps": 30,
         "seed": 12345
     }
     """
     job_input = job.get("input", {})
+    temp_dir = None
     video_path = None
     ref_image_path = None
-    pose_video_path = None
 
     try:
         # =====================================================================
-        # REQUIRED: VIDEO
+        # REQUIRED: REFERENCE IMAGE
         # =====================================================================
-        video_data = job_input.get("video", "")
-        if not video_data:
-            return {"error": "video is required (base64 encoded)"}
+        reference_image_data = job_input.get("reference_image", "")
+        if not reference_image_data:
+            return {"error": "reference_image is required (base64 encoded)"}
 
-        video_bytes = decode_base64_data(video_data)
+        ref_bytes = decode_base64_data(reference_image_data)
+        ref_image_path = save_temp_file(ref_bytes, ".png")
+
+        # =====================================================================
+        # REQUIRED: DRIVING VIDEO
+        # =====================================================================
+        driving_video_data = job_input.get("driving_video", "")
+        if not driving_video_data:
+            return {"error": "driving_video is required (base64 encoded)"}
+
+        video_bytes = decode_base64_data(driving_video_data)
         video_path = save_temp_file(video_bytes, ".mp4")
 
         # =====================================================================
-        # OPTIONAL: REFERENCE IMAGE
-        # =====================================================================
-        reference_image_data = job_input.get("reference_image", "")
-        if reference_image_data:
-            ref_bytes = decode_base64_data(reference_image_data)
-            ref_image_path = save_temp_file(ref_bytes, ".png")
-
-        # =====================================================================
-        # OPTIONAL: POSE VIDEO
-        # =====================================================================
-        pose_video_data = job_input.get("pose_video", "")
-        if pose_video_data:
-            pose_bytes = decode_base64_data(pose_video_data)
-            pose_video_path = save_temp_file(pose_bytes, ".mp4")
-
-        # =====================================================================
-        # GENERATION PARAMETERS
+        # OPTIONAL PARAMETERS
         # =====================================================================
         prompt = job_input.get("prompt", "").strip()
-        negative_prompt = job_input.get(
-            "negative_prompt",
-            "poor quality, blurred, distorted, watermark, low resolution, "
-            "ugly, bad anatomy, deformed, static, frozen"
-        )
+        if not prompt:
+            prompt = "视频中的人在做动作"  # Default: "Person doing actions in video"
 
-        size = job_input.get("size", "1280x720")
-        width, height = parse_resolution(size)
+        negative_prompt = job_input.get("negative_prompt", "")
 
-        num_frames = job_input.get("num_frames", job_input.get("frame_num", 81))
-        num_frames = int(num_frames)
-        if (num_frames - 1) % 4 != 0:
-            num_frames = ((num_frames - 1) // 4) * 4 + 1
-        num_frames = max(5, min(257, num_frames))
+        resolution = job_input.get("resolution", [1280, 720])
+        if isinstance(resolution, str):
+            if "x" in resolution.lower():
+                parts = resolution.lower().split("x")
+                resolution = [int(parts[0]), int(parts[1])]
+            elif "*" in resolution:
+                parts = resolution.split("*")
+                resolution = [int(parts[0]), int(parts[1])]
+        resolution = tuple(resolution)
 
-        # =====================================================================
-        # SAMPLING PARAMETERS
-        # =====================================================================
-        sample_steps = int(job_input.get("sample_steps", job_input.get("num_inference_steps", 50)))
-        sample_guide_scale = float(job_input.get("sample_guide_scale", job_input.get("guidance_scale", 5.0)))
-        sample_shift = float(job_input.get("sample_shift", job_input.get("flow_shift", 5.0)))
-        sample_solver = job_input.get("sample_solver", "unipc")
+        fps = int(job_input.get("fps", 30))
+        clip_len = int(job_input.get("clip_len", job_input.get("frame_num", 77)))
 
-        # =====================================================================
-        # ANIMATE-SPECIFIC PARAMETERS
-        # =====================================================================
+        # Ensure clip_len is 4n+1 format
+        if (clip_len - 1) % 4 != 0:
+            clip_len = ((clip_len - 1) // 4) * 4 + 1
+
         refert_num = int(job_input.get("refert_num", 1))
         if refert_num not in [1, 5]:
             refert_num = 1
 
-        replace_flag = job_input.get("replace_flag", False)
-        use_relighting_lora = job_input.get("use_relighting_lora", False)
+        sampling_steps = int(job_input.get("sampling_steps", job_input.get("sample_steps", 20)))
+        guide_scale = float(job_input.get("guide_scale", job_input.get("sample_guide_scale", 1.0)))
+        shift = float(job_input.get("shift", job_input.get("sample_shift", 5.0)))
+        sample_solver = job_input.get("sample_solver", "dpm++")
 
-        # =====================================================================
-        # OUTPUT PARAMETERS
-        # =====================================================================
         seed = job_input.get("seed", job_input.get("base_seed", None))
         if seed is None or seed == -1:
             seed = torch.randint(0, 2**32 - 1, (1,)).item()
         seed = int(seed)
 
-        fps = max(8, min(60, int(job_input.get("fps", 16))))
+        offload_model = job_input.get("offload_model", True)
+
+        retarget_flag = job_input.get("retarget_flag", False)
+        if isinstance(retarget_flag, str):
+            retarget_flag = retarget_flag.lower() in ("true", "1", "yes")
 
         # =====================================================================
-        # GENERATE
+        # STEP 1: PREPROCESSING
         # =====================================================================
-        generator = torch.Generator(device="cuda").manual_seed(seed)
+        temp_dir = tempfile.mkdtemp(prefix="wan_animate_")
 
-        logger.info(f"V2V/Animate: {width}x{height}, {num_frames}f")
-        logger.info(f"refert_num={refert_num}, replace={replace_flag}, relighting={use_relighting_lora}")
+        logger.info("=" * 60)
+        logger.info("STEP 1: Preprocessing")
+        logger.info("=" * 60)
+
+        run_preprocessing(
+            video_path=video_path,
+            reference_image_path=ref_image_path,
+            output_dir=temp_dir,
+            resolution=resolution,
+            fps=fps,
+            retarget_flag=retarget_flag
+        )
+
+        # =====================================================================
+        # STEP 2: GENERATION
+        # =====================================================================
+        logger.info("=" * 60)
+        logger.info("STEP 2: Generation")
+        logger.info(f"  clip_len={clip_len}, refert_num={refert_num}")
+        logger.info(f"  sampling_steps={sampling_steps}, guide_scale={guide_scale}")
+        logger.info(f"  shift={shift}, solver={sample_solver}")
+        logger.info(f"  seed={seed}")
+        logger.info("=" * 60)
 
         pipeline = load_model()
 
-        kwargs = {
-            "video": video_path,
-            "prompt": prompt,
-            "negative_prompt": negative_prompt,
-            "height": height,
-            "width": width,
-            "num_frames": num_frames,
-            "guidance_scale": sample_guide_scale,
-            "num_inference_steps": sample_steps,
-            "generator": generator,
-            "flow_shift": sample_shift,
-            "refert_num": refert_num,
-            "replace_flag": replace_flag,
-            "use_relighting_lora": use_relighting_lora
-        }
-
-        if ref_image_path:
-            kwargs["reference_image"] = ref_image_path
-        if pose_video_path:
-            kwargs["pose_video"] = pose_video_path
-
         with torch.inference_mode():
-            output = pipeline(**kwargs)
+            video_tensor = pipeline.generate(
+                src_root_path=temp_dir,
+                replace_flag=False,
+                clip_len=clip_len,
+                refert_num=refert_num,
+                shift=shift,
+                sample_solver=sample_solver,
+                sampling_steps=sampling_steps,
+                guide_scale=guide_scale,
+                input_prompt=prompt,
+                n_prompt=negative_prompt,
+                seed=seed,
+                offload_model=offload_model
+            )
 
-        output_path = tempfile.mktemp(suffix=".mp4")
-        output.save(output_path, fps=fps)
+        # =====================================================================
+        # STEP 3: SAVE OUTPUT
+        # =====================================================================
+        logger.info("Saving output video...")
+
+        from wan.utils.utils import save_video
+
+        output_path = os.path.join(temp_dir, "output.mp4")
+        save_video(
+            tensor=video_tensor[None],  # Add batch dimension
+            save_file=output_path,
+            fps=fps,
+            nrow=1,
+            normalize=True,
+            value_range=(-1, 1)
+        )
+
         video_base64 = encode_video_base64(output_path)
 
         # Cleanup
-        os.remove(output_path)
-        os.remove(video_path)
-        video_path = None
-        if ref_image_path:
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        if video_path and os.path.exists(video_path):
+            os.remove(video_path)
+        if ref_image_path and os.path.exists(ref_image_path):
             os.remove(ref_image_path)
-            ref_image_path = None
-        if pose_video_path:
-            os.remove(pose_video_path)
-            pose_video_path = None
         cleanup()
+
+        logger.info("Generation completed successfully!")
 
         return {
             "video": video_base64,
             "format": "mp4",
-            "width": width,
-            "height": height,
-            "num_frames": num_frames,
+            "resolution": list(resolution),
             "fps": fps,
             "seed": seed
         }
 
     except torch.cuda.OutOfMemoryError as e:
-        for p in [video_path, ref_image_path, pose_video_path]:
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        for p in [video_path, ref_image_path]:
             if p and os.path.exists(p):
                 os.remove(p)
         cleanup()
         return {"error": "Out of GPU memory", "details": str(e)}
     except Exception as e:
-        for p in [video_path, ref_image_path, pose_video_path]:
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        for p in [video_path, ref_image_path]:
             if p and os.path.exists(p):
                 os.remove(p)
         cleanup()
@@ -418,8 +548,15 @@ def concurrency_modifier(current_concurrency: int) -> int:
 
 
 if __name__ == "__main__":
-    logger.info("Initializing WAN 2.2 V2V/Animate Handler...")
+    logger.info("=" * 60)
+    logger.info("Initializing WAN 2.2 Animate Handler...")
+    logger.info("Mode: Animation (motion transfer)")
+    logger.info("=" * 60)
+
     try:
+        # Pre-load preprocessing pipeline
+        load_preprocess_pipeline()
+        # Pre-load main model
         load_model()
     except Exception as e:
         logger.warning(f"Pre-load failed: {e}")

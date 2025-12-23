@@ -3,6 +3,10 @@ WAN 2.2 Text+Image-to-Video (TI2V) Handler for RunPod Serverless
 Model: Wan2.2-TI2V-5B (5B parameters)
 GPU: RTX 4090 24GB or A100
 License: Apache 2.0 (Commercial use allowed)
+
+Supports TWO modes:
+  - T2V (Text-to-Video): prompt only, no image
+  - I2V (Image-to-Video): prompt + image
 """
 
 import os
@@ -15,7 +19,6 @@ import traceback
 import logging
 from typing import Dict, Any
 from PIL import Image
-from io import BytesIO
 
 import runpod
 
@@ -36,7 +39,6 @@ def _patched_load_file(filename, device="cpu"):
 safetensors.torch.load_file = _patched_load_file
 logger.info("Patched safetensors to load via CPU")
 
-# Add WAN 2.2 to path
 sys.path.insert(0, "/app/Wan2.2")
 
 MODEL = None
@@ -84,7 +86,6 @@ def load_model():
     if MODEL is not None:
         return MODEL
 
-    # Initialize CUDA before loading model
     if torch.cuda.is_available():
         torch.cuda.init()
         torch.cuda.set_device(0)
@@ -145,13 +146,13 @@ def save_temp_file(data: bytes, suffix: str) -> str:
 
 def parse_resolution(size: str) -> tuple:
     if not size:
-        return (832, 480)
+        return (1280, 704)
     if "*" in size:
         parts = size.split("*")
     elif "x" in size.lower():
         parts = size.lower().split("x")
     else:
-        return (832, 480)
+        return (1280, 704)
     return (int(parts[0]), int(parts[1]))
 
 
@@ -166,76 +167,171 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     WAN 2.2 TI2V-5B Handler (Text + Image to Video)
 
     Supports TWO modes:
-        - T2V (Text-to-Video): prompt only, no image
-        - I2V (Image-to-Video): prompt + image
+      - T2V (Text-to-Video): prompt only, no image
+      - I2V (Image-to-Video): prompt + image
 
-    Required:
-        prompt (str): Text description of the video
+    ═══════════════════════════════════════════════════════════════════════════
+    REQUIRED PARAMETERS
+    ═══════════════════════════════════════════════════════════════════════════
 
-    Optional:
-        image (str): Base64 encoded input image (if provided, runs I2V mode)
-        negative_prompt (str): What to avoid
-        size (str): Resolution "WIDTHxHEIGHT" (default: 1280x704 for 720P)
-        num_frames (int): Frame count, must be 4n+1 (default: 81)
-        sample_steps (int): Denoising steps (default: 50)
-        guidance_scale (float): CFG scale (default: 5.0)
-        seed (int): Random seed (-1 for random)
-        fps (int): Output FPS (default: 16)
+    prompt (str):
+        Text description of the video to generate.
+
+    ═══════════════════════════════════════════════════════════════════════════
+    OPTIONAL - MODE SELECTION
+    ═══════════════════════════════════════════════════════════════════════════
+
+    image (str, optional):
+        Base64 encoded input image.
+        If provided: runs I2V mode (image-to-video)
+        If not provided: runs T2V mode (text-to-video)
+
+    ═══════════════════════════════════════════════════════════════════════════
+    OPTIONAL - GENERATION PARAMETERS
+    ═══════════════════════════════════════════════════════════════════════════
+
+    negative_prompt (str, default: from config):
+        What to avoid in generation.
+
+    size (str, default: "1280x704"):
+        Resolution "WIDTHxHEIGHT".
+        720P = 1280x704
+
+    frame_num (int, default: 121):
+        Frame count. Must be 4n+1 format.
+        Max 257 frames.
+
+    ═══════════════════════════════════════════════════════════════════════════
+    OPTIONAL - SAMPLING PARAMETERS
+    ═══════════════════════════════════════════════════════════════════════════
+
+    sampling_steps (int, default: T2V=50, I2V=40):
+        Diffusion denoising steps.
+        Note: I2V mode uses 40 steps by default (faster).
+
+    guide_scale (float, default: 5.0):
+        Classifier-free guidance scale.
+
+    shift (float, default: 5.0):
+        Flow matching shift parameter.
+        Use 3.0 for 480p resolution.
+
+    sample_solver (str, default: "unipc"):
+        Solver: "unipc" or "dpm++"
+
+    ═══════════════════════════════════════════════════════════════════════════
+    OPTIONAL - OUTPUT PARAMETERS
+    ═══════════════════════════════════════════════════════════════════════════
+
+    seed (int, default: random):
+        Random seed for reproducibility. -1 for random.
+
+    fps (int, default: 24):
+        Output video FPS.
+
+    offload_model (bool, default: true):
+        Offload model to CPU after generation to save VRAM.
+        Set to false for faster generation on high-VRAM GPUs (A100 80GB).
+
+    ═══════════════════════════════════════════════════════════════════════════
+    RESPONSE FORMAT
+    ═══════════════════════════════════════════════════════════════════════════
+
+    {
+        "video": "<base64_mp4>",
+        "format": "mp4",
+        "width": 1280,
+        "height": 704,
+        "frame_num": 121,
+        "fps": 24,
+        "seed": 12345,
+        "mode": "T2V" or "I2V"
+    }
     """
     job_input = job.get("input", {})
     image_path = None
 
     try:
+        # =====================================================================
+        # REQUIRED: PROMPT
+        # =====================================================================
         prompt = job_input.get("prompt", "").strip()
         if not prompt:
             return {"error": "prompt is required"}
 
-        # Image is OPTIONAL - if provided, runs I2V mode; if not, runs T2V mode
+        # =====================================================================
+        # OPTIONAL: IMAGE (determines T2V vs I2V mode)
+        # =====================================================================
         image_data = job_input.get("image", "")
+        input_img = None
+        is_i2v_mode = False
+
         if image_data:
             image_bytes = decode_base64_image(image_data)
             image_path = save_temp_file(image_bytes, ".png")
+            input_img = Image.open(image_path).convert('RGB')
+            is_i2v_mode = True
 
-        negative_prompt = job_input.get(
-            "negative_prompt",
-            "poor quality, blurred, distorted, watermark, low resolution"
-        )
+        # =====================================================================
+        # NEGATIVE PROMPT
+        # =====================================================================
+        negative_prompt = job_input.get("negative_prompt", job_input.get("n_prompt", ""))
 
-        size = job_input.get("size", "1280x704")  # TI2V-5B uses 1280x704 for 720P
+        # =====================================================================
+        # GENERATION PARAMETERS
+        # =====================================================================
+        size = job_input.get("size", "1280x704")
         width, height = parse_resolution(size)
 
-        num_frames = job_input.get("num_frames", job_input.get("frame_num", 81))
-        num_frames = int(num_frames)
-        if (num_frames - 1) % 4 != 0:
-            num_frames = ((num_frames - 1) // 4) * 4 + 1
-        num_frames = max(5, min(257, num_frames))
+        frame_num = job_input.get("frame_num", job_input.get("num_frames", 121))
+        frame_num = int(frame_num)
+        # Ensure 4n+1 format
+        if (frame_num - 1) % 4 != 0:
+            frame_num = ((frame_num - 1) // 4) * 4 + 1
+        frame_num = max(5, min(257, frame_num))
 
-        sample_steps = int(job_input.get("sample_steps", job_input.get("num_inference_steps", 50)))
-        guidance_scale = float(job_input.get("guidance_scale", job_input.get("sample_guide_scale", 5.0)))
-        sample_shift = float(job_input.get("sample_shift", job_input.get("flow_shift", 3.0)))
+        # =====================================================================
+        # SAMPLING PARAMETERS (with mode-specific defaults)
+        # =====================================================================
+        # I2V uses 40 steps by default, T2V uses 50
+        default_steps = 40 if is_i2v_mode else 50
+        sampling_steps = int(job_input.get("sampling_steps", job_input.get("sample_steps", default_steps)))
+
+        guide_scale = float(job_input.get("guide_scale", job_input.get("sample_guide_scale", 5.0)))
+        shift = float(job_input.get("shift", job_input.get("sample_shift", 5.0)))
         sample_solver = job_input.get("sample_solver", "unipc")
 
+        # =====================================================================
+        # OUTPUT PARAMETERS
+        # =====================================================================
         seed = job_input.get("seed", job_input.get("base_seed", None))
         if seed is None or seed == -1:
             seed = torch.randint(0, 2**32 - 1, (1,)).item()
         seed = int(seed)
 
-        fps = max(8, min(60, int(job_input.get("fps", 16))))
+        fps = int(job_input.get("fps", 24))
+        fps = max(8, min(60, fps))
 
-        logger.info(f"TI2V-5B: {width}x{height}, {num_frames}f, steps={sample_steps}")
-        logger.info(f"Prompt: {prompt[:100]}...")
+        offload_model = job_input.get("offload_model", True)
+        if isinstance(offload_model, str):
+            offload_model = offload_model.lower() in ("true", "1", "yes")
+
+        # =====================================================================
+        # GENERATE
+        # =====================================================================
+        mode = "I2V" if is_i2v_mode else "T2V"
+        logger.info("=" * 60)
+        logger.info(f"TI2V-5B Generation - Mode: {mode}")
+        logger.info(f"  Resolution: {width}x{height}")
+        logger.info(f"  Frames: {frame_num}")
+        logger.info(f"  Steps: {sampling_steps}, Guide: {guide_scale}, Shift: {shift}")
+        logger.info(f"  Solver: {sample_solver}")
+        logger.info(f"  Seed: {seed}, FPS: {fps}")
+        logger.info(f"  Offload: {offload_model}")
+        logger.info(f"  Prompt: {prompt[:80]}...")
+        logger.info("=" * 60)
 
         wan_ti2v = load_model()
-
-        max_area = width * height
-
-        # Load image if provided (I2V mode), otherwise None (T2V mode)
-        input_img = None
-        if image_path:
-            input_img = Image.open(image_path).convert('RGB')
-            logger.info("Mode: Image-to-Video (I2V)")
-        else:
-            logger.info("Mode: Text-to-Video (T2V)")
 
         with torch.inference_mode():
             video_tensor = wan_ti2v.generate(
@@ -243,20 +339,26 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 img=input_img,
                 size=(width, height),
                 max_area=width * height,
-                frame_num=num_frames,
-                shift=sample_shift,
+                frame_num=frame_num,
+                shift=shift,
                 sample_solver=sample_solver,
-                sampling_steps=sample_steps,
-                guide_scale=guidance_scale,
+                sampling_steps=sampling_steps,
+                guide_scale=guide_scale,
+                n_prompt=negative_prompt,
                 seed=seed,
-                offload_model=False,  # 80GB VRAM - no offloading needed
+                offload_model=offload_model,
             )
 
+        # =====================================================================
+        # SAVE VIDEO
+        # =====================================================================
+        logger.info("Saving output video...")
+
         from wan.utils.utils import save_video
+
         output_path = tempfile.mktemp(suffix=".mp4")
-        # Add batch dimension [None] as expected by save_video
         save_video(
-            tensor=video_tensor[None],
+            tensor=video_tensor[None],  # Add batch dimension
             save_file=output_path,
             fps=fps,
             nrow=1,
@@ -265,28 +367,31 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         )
 
         video_base64 = encode_video_base64(output_path)
+
+        # Cleanup
         os.remove(output_path)
-        if image_path:
+        if image_path and os.path.exists(image_path):
             os.remove(image_path)
         cleanup()
+
+        logger.info(f"TI2V-5B {mode} generation completed successfully!")
 
         return {
             "video": video_base64,
             "format": "mp4",
             "width": width,
             "height": height,
-            "num_frames": num_frames,
+            "frame_num": frame_num,
             "fps": fps,
             "seed": seed,
-            "model": "Wan2.2-TI2V-5B",
-            "mode": "I2V" if input_img else "T2V"
+            "mode": mode
         }
 
     except torch.cuda.OutOfMemoryError as e:
         if image_path and os.path.exists(image_path):
             os.remove(image_path)
         cleanup()
-        return {"error": "Out of GPU memory. Reduce resolution or num_frames.", "details": str(e)}
+        return {"error": "Out of GPU memory. Reduce resolution or frame_num.", "details": str(e)}
     except Exception as e:
         if image_path and os.path.exists(image_path):
             os.remove(image_path)
@@ -300,7 +405,16 @@ def concurrency_modifier(current_concurrency: int) -> int:
 
 
 if __name__ == "__main__":
+    logger.info("=" * 60)
     logger.info("Initializing WAN 2.2 TI2V-5B Handler...")
+    logger.info("Modes: T2V (text-only) and I2V (text+image)")
+    logger.info("=" * 60)
+
+    try:
+        load_model()
+    except Exception as e:
+        logger.warning(f"Pre-load failed: {e}")
+
     runpod.serverless.start({
         "handler": handler,
         "concurrency_modifier": concurrency_modifier,

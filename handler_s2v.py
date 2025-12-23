@@ -3,7 +3,14 @@ WAN 2.2 Speech-to-Video (S2V) Handler for RunPod Serverless
 Model: Wan2.2-S2V-14B
 License: Apache 2.0 (Commercial use allowed)
 
-ALL PARAMETERS EXPOSED
+Generates talking head videos with lip-sync from audio or text-to-speech.
+
+INPUT:
+  - image: Base64 encoded reference face image
+  - audio: Base64 encoded audio file (or use TTS mode)
+
+OUTPUT:
+  - Video with lip-synced speech
 """
 
 import os
@@ -21,27 +28,20 @@ import runpod
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Fix safetensors "device cuda:0 is invalid" error
-# The safetensors Rust backend has a bug with CUDA device strings
-# Workaround: Load checkpoint to CPU RAM first, then model moves tensors to GPU
-# This is safe - only checkpoint I/O uses CPU, model runs on GPU
+# Fix safetensors "device cuda:0 is invalid" error (Rust CUDA bug workaround)
 import safetensors.torch
 _original_load_file = safetensors.torch.load_file
 
 def _patched_load_file(filename, device="cpu"):
-    # Force CPU load to avoid safetensors Rust CUDA bug
-    # The model's .to(device) will move tensors to GPU after loading
     result = _original_load_file(filename, device="cpu")
-    # If originally requested GPU, move tensors to GPU now
     if device != "cpu" and torch.cuda.is_available():
         target = torch.device("cuda:0")
         result = {k: v.to(target) for k, v in result.items()}
     return result
 
 safetensors.torch.load_file = _patched_load_file
-logger.info("Patched safetensors to load via CPU (workaround for Rust CUDA bug)")
+logger.info("Patched safetensors to load via CPU")
 
-# Add WAN 2.2 to path (baked into Docker image)
 sys.path.insert(0, "/app/Wan2.2")
 
 MODEL = None
@@ -53,24 +53,13 @@ WAN_CONFIG_KEY = "s2v-14B"
 
 
 def ensure_model_downloaded(model_dir: str, model_name: str, hf_repo_id: str) -> str:
-    """
-    Check if model exists, download from HuggingFace if not.
-    Returns the path to the model directory.
-    """
+    """Check if model exists, download from HuggingFace if not."""
     ckpt_dir = os.path.join(model_dir, model_name)
 
-    # Check if model already exists (look for key files)
-    if os.path.exists(ckpt_dir):
-        # Check for typical model files
-        has_files = any(
-            os.path.exists(os.path.join(ckpt_dir, f))
-            for f in ["config.json", "model_index.json", "diffusion_pytorch_model.safetensors"]
-        )
-        if has_files or len(os.listdir(ckpt_dir)) > 0:
-            logger.info(f"Model found at {ckpt_dir}")
-            return ckpt_dir
+    if os.path.exists(ckpt_dir) and len(os.listdir(ckpt_dir)) > 0:
+        logger.info(f"Model found at {ckpt_dir}")
+        return ckpt_dir
 
-    # Model not found, download from HuggingFace
     logger.info("=" * 60)
     logger.info(f"Model not found at {ckpt_dir}")
     logger.info(f"Downloading {model_name} from HuggingFace...")
@@ -80,21 +69,15 @@ def ensure_model_downloaded(model_dir: str, model_name: str, hf_repo_id: str) ->
 
     try:
         from huggingface_hub import snapshot_download
-
-        # Ensure model directory exists
         os.makedirs(model_dir, exist_ok=True)
-
-        # Download the model
         snapshot_download(
             repo_id=hf_repo_id,
             local_dir=ckpt_dir,
             local_dir_use_symlinks=False,
             resume_download=True,
         )
-
         logger.info(f"Model downloaded successfully to {ckpt_dir}")
         return ckpt_dir
-
     except Exception as e:
         logger.error(f"Failed to download model: {e}")
         raise RuntimeError(f"Failed to download model from {hf_repo_id}: {e}")
@@ -106,17 +89,13 @@ def load_model():
     if MODEL is not None:
         return MODEL
 
-    # Initialize CUDA before loading model
     if torch.cuda.is_available():
         torch.cuda.init()
         torch.cuda.set_device(0)
-        # Warm up CUDA
         _ = torch.zeros(1).cuda()
         logger.info(f"CUDA initialized: {torch.cuda.get_device_name(0)}")
 
     model_dir = os.environ.get("MODEL_DIR", "/runpod-volume/models")
-
-    # Ensure model is downloaded
     ckpt_dir = ensure_model_downloaded(model_dir, MODEL_NAME, HF_REPO_ID)
 
     logger.info("=" * 60)
@@ -168,18 +147,6 @@ def save_temp_file(data: bytes, suffix: str) -> str:
         return f.name
 
 
-def parse_resolution(size: str) -> tuple:
-    if not size:
-        return (1280, 720)
-    if "*" in size:
-        parts = size.split("*")
-    elif "x" in size.lower():
-        parts = size.lower().split("x")
-    else:
-        return (1280, 720)
-    return (int(parts[0]), int(parts[1]))
-
-
 def get_audio_duration(audio_path: str) -> float:
     try:
         import soundfile as sf
@@ -197,10 +164,21 @@ def cleanup():
 
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     """
-    WAN 2.2 Speech-to-Video Handler - ALL PARAMETERS
+    WAN 2.2 Speech-to-Video Handler
+
+    Generates talking head videos with lip-sync from audio or text-to-speech.
 
     ═══════════════════════════════════════════════════════════════════════════
-    REQUIRED PARAMETERS (Option A: Pre-recorded Audio)
+    REQUIRED PARAMETERS
+    ═══════════════════════════════════════════════════════════════════════════
+
+    image (str):
+        Base64 encoded reference face image.
+        Clear frontal face recommended for best results.
+        Supports PNG, JPG, WEBP.
+
+    ═══════════════════════════════════════════════════════════════════════════
+    AUDIO INPUT (Option A: Pre-recorded Audio)
     ═══════════════════════════════════════════════════════════════════════════
 
     audio (str):
@@ -208,60 +186,55 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         Supports WAV, MP3, FLAC, OGG.
         Speech audio drives lip sync.
 
-    image (str):
-        Base64 encoded reference image.
-        Clear frontal face recommended.
-        Supports PNG, JPG, WEBP.
-
     ═══════════════════════════════════════════════════════════════════════════
-    REQUIRED PARAMETERS (Option B: Text-to-Speech)
+    AUDIO INPUT (Option B: Text-to-Speech)
     ═══════════════════════════════════════════════════════════════════════════
 
     enable_tts (bool, default: false):
-        Enable text-to-speech synthesis.
+        Enable text-to-speech synthesis using CosyVoice2.
         When true, generates audio from text instead of using audio input.
+        Note: CosyVoice2 will be downloaded on first use (~1GB).
 
     tts_text (str, required if enable_tts=true):
         Text to synthesize into speech.
 
     tts_prompt_audio (str, optional):
-        Base64 encoded reference voice sample for TTS.
-        Model clones this voice.
+        Base64 encoded reference voice sample for voice cloning.
+        Model will attempt to clone this voice.
 
     tts_prompt_text (str, optional):
         Transcription of tts_prompt_audio.
-        Helps model understand reference voice.
+        Helps model understand reference voice better.
 
     ═══════════════════════════════════════════════════════════════════════════
     GENERATION PARAMETERS
     ═══════════════════════════════════════════════════════════════════════════
 
     prompt (str, default: ""):
-        Additional text guidance.
+        Additional text guidance for video style.
         Example: "Professional news anchor in studio"
 
-    negative_prompt (str, default: "..."):
-        What to avoid.
+    negative_prompt (str, default: from config):
+        What to avoid in generation.
 
-    size (str, default: "1280x720"):
-        Output resolution.
-
-    num_frames / frame_num (int, default: auto):
-        Output frames. Auto-calculated from audio if not set.
-        Must be 4n+1 format.
+    max_area (int, default: 921600):
+        Maximum pixel area (width * height).
+        Default is 1280x720 = 921600.
+        Model auto-calculates resolution from reference image.
 
     ═══════════════════════════════════════════════════════════════════════════
     SAMPLING PARAMETERS
     ═══════════════════════════════════════════════════════════════════════════
 
-    sample_steps / num_inference_steps (int, default: 50):
-        Denoising steps.
+    sampling_steps (int, default: 40):
+        Diffusion denoising steps. Higher = better quality, slower.
 
-    sample_guide_scale / guidance_scale (float, default: 5.0):
-        CFG scale.
+    guide_scale (float, default: 4.5):
+        Classifier-free guidance scale.
 
-    sample_shift / flow_shift (float, default: 5.0):
-        Flow matching shift.
+    shift (float, default: 3.0):
+        Flow matching shift parameter.
+        Note: Use 3.0 for 480p, can increase for higher res.
 
     sample_solver (str, default: "unipc"):
         Solver: "unipc" or "dpm++"
@@ -270,25 +243,36 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     S2V-SPECIFIC PARAMETERS
     ═══════════════════════════════════════════════════════════════════════════
 
-    num_clip (int, default: 1):
+    num_repeat (int, default: auto):
         Number of video clips to generate.
-        For long audio, splits into multiple clips.
+        Auto-calculated from audio duration if not specified.
+        For long audio, model generates multiple clips and concatenates.
 
-    infer_frames (int, default: auto):
-        Frames per clip inference.
+    infer_frames (int, default: 80):
+        Frames per clip. Must be divisible by 4.
+        Higher = longer clips but more VRAM.
 
-    start_from_ref (bool, default: true):
-        Use reference image as starting frame.
+    init_first_frame (bool, default: false):
+        Use reference image as the exact first frame.
+        When false, model may slightly modify the appearance.
+
+    pose_video (str, optional):
+        Base64 encoded pose video for pose-driven generation.
+        If provided, uses pose sequence to drive the generated video.
 
     ═══════════════════════════════════════════════════════════════════════════
     OUTPUT PARAMETERS
     ═══════════════════════════════════════════════════════════════════════════
 
-    seed / base_seed (int, default: random):
-        Random seed.
+    seed (int, default: random):
+        Random seed for reproducibility. -1 for random.
 
-    fps (int, default: 24):
-        Output FPS. 24 recommended for lip sync.
+    fps (int, default: 16):
+        Output video FPS.
+        Note: Model internally uses 16 FPS for audio sync calculations.
+
+    offload_model (bool, default: true):
+        Offload model to CPU after generation to save VRAM.
 
     ═══════════════════════════════════════════════════════════════════════════
     RESPONSE FORMAT
@@ -297,10 +281,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     {
         "video": "<base64_mp4>",
         "format": "mp4",
-        "width": 1280,
-        "height": 720,
-        "num_frames": 120,
-        "fps": 24,
+        "fps": 16,
         "seed": 12345,
         "audio_duration": 5.0,
         "tts_used": false
@@ -310,6 +291,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     audio_path = None
     image_path = None
     tts_prompt_audio_path = None
+    pose_video_path = None
+    output_path = None
 
     try:
         # =====================================================================
@@ -317,49 +300,45 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         # =====================================================================
         image_data = job_input.get("image", "")
         if not image_data:
-            return {"error": "image is required (base64 encoded reference image)"}
+            return {"error": "image is required (base64 encoded reference face image)"}
 
         image_bytes = decode_base64_data(image_data)
         image_path = save_temp_file(image_bytes, ".png")
 
         # =====================================================================
-        # AUDIO: Either direct audio or TTS
+        # AUDIO INPUT: Either direct audio or TTS
         # =====================================================================
         enable_tts = job_input.get("enable_tts", False)
-        tts_used = False
+        if isinstance(enable_tts, str):
+            enable_tts = enable_tts.lower() in ("true", "1", "yes")
+
+        tts_text = None
+        tts_prompt_audio_for_gen = None
+        tts_prompt_text_for_gen = None
 
         if enable_tts:
-            # TTS Mode
+            # TTS Mode - let the model handle TTS internally
             tts_text = job_input.get("tts_text", "")
             if not tts_text:
                 return {"error": "tts_text is required when enable_tts=true"}
 
             tts_prompt_audio_data = job_input.get("tts_prompt_audio", "")
-            tts_prompt_text = job_input.get("tts_prompt_text", "")
+            tts_prompt_text_for_gen = job_input.get("tts_prompt_text", None)
 
             if tts_prompt_audio_data:
                 tts_prompt_audio_bytes = decode_base64_data(tts_prompt_audio_data)
                 tts_prompt_audio_path = save_temp_file(tts_prompt_audio_bytes, ".wav")
+                tts_prompt_audio_for_gen = tts_prompt_audio_path
 
-            # Generate audio via TTS
-            try:
-                from wan.utils.tts import synthesize_speech
-                audio_path = tempfile.mktemp(suffix=".wav")
-                synthesize_speech(
-                    text=tts_text,
-                    output_path=audio_path,
-                    prompt_audio=tts_prompt_audio_path,
-                    prompt_text=tts_prompt_text
-                )
-                tts_used = True
-                logger.info(f"TTS generated: {tts_text[:50]}...")
-            except Exception as e:
-                return {"error": f"TTS synthesis failed: {str(e)}"}
+            # Audio path will be generated by the model's TTS
+            audio_path = None
+            audio_duration = len(tts_text) * 0.1  # Rough estimate for logging
+            logger.info(f"TTS mode enabled: '{tts_text[:50]}...'")
         else:
             # Direct audio mode
             audio_data = job_input.get("audio", "")
             if not audio_data:
-                return {"error": "audio is required (base64 encoded) or enable_tts=true"}
+                return {"error": "audio is required (base64 encoded) or set enable_tts=true"}
 
             audio_bytes = decode_base64_data(audio_data)
             if audio_bytes[:4] == b'RIFF':
@@ -369,48 +348,52 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             else:
                 audio_suffix = ".wav"
             audio_path = save_temp_file(audio_bytes, audio_suffix)
+            audio_duration = get_audio_duration(audio_path)
 
-        audio_duration = get_audio_duration(audio_path)
         logger.info(f"Audio duration: {audio_duration:.2f}s")
+
+        # =====================================================================
+        # OPTIONAL: POSE VIDEO
+        # =====================================================================
+        pose_video_data = job_input.get("pose_video", "")
+        if pose_video_data:
+            pose_video_bytes = decode_base64_data(pose_video_data)
+            pose_video_path = save_temp_file(pose_video_bytes, ".mp4")
+            logger.info("Pose video provided for pose-driven generation")
 
         # =====================================================================
         # GENERATION PARAMETERS
         # =====================================================================
         prompt = job_input.get("prompt", "").strip()
-        negative_prompt = job_input.get(
-            "negative_prompt",
-            "poor quality, blurred, distorted, watermark, bad lip sync, "
-            "unnatural movement, static, frozen face, ugly"
-        )
+        negative_prompt = job_input.get("negative_prompt", "")
 
-        size = job_input.get("size", "1280x720")
-        width, height = parse_resolution(size)
-
-        fps = max(8, min(60, int(job_input.get("fps", 24))))
-
-        # Auto-calculate frames from audio
-        num_frames = job_input.get("num_frames", job_input.get("frame_num", None))
-        if num_frames is None:
-            num_frames = int(audio_duration * fps) + 1
-        num_frames = int(num_frames)
-        if (num_frames - 1) % 4 != 0:
-            num_frames = ((num_frames - 1) // 4) * 4 + 1
-        num_frames = max(5, min(257, num_frames))
+        # Max area for resolution calculation
+        max_area = int(job_input.get("max_area", 1280 * 720))
 
         # =====================================================================
-        # SAMPLING PARAMETERS
+        # SAMPLING PARAMETERS (with correct defaults from official config)
         # =====================================================================
-        sample_steps = int(job_input.get("sample_steps", job_input.get("num_inference_steps", 50)))
-        sample_guide_scale = float(job_input.get("sample_guide_scale", job_input.get("guidance_scale", 5.0)))
-        sample_shift = float(job_input.get("sample_shift", job_input.get("flow_shift", 5.0)))
+        sampling_steps = int(job_input.get("sampling_steps", job_input.get("sample_steps", 40)))
+        guide_scale = float(job_input.get("guide_scale", job_input.get("sample_guide_scale", 4.5)))
+        shift = float(job_input.get("shift", job_input.get("sample_shift", 3.0)))
         sample_solver = job_input.get("sample_solver", "unipc")
 
         # =====================================================================
         # S2V-SPECIFIC PARAMETERS
         # =====================================================================
-        num_clip = int(job_input.get("num_clip", 1))
-        infer_frames = job_input.get("infer_frames", None)
-        start_from_ref = job_input.get("start_from_ref", True)
+        num_repeat = job_input.get("num_repeat", job_input.get("num_clip", None))
+        if num_repeat is not None:
+            num_repeat = int(num_repeat)
+
+        infer_frames = int(job_input.get("infer_frames", 80))
+        # Ensure divisible by 4
+        if infer_frames % 4 != 0:
+            infer_frames = (infer_frames // 4) * 4
+        infer_frames = max(4, infer_frames)
+
+        init_first_frame = job_input.get("init_first_frame", job_input.get("start_from_ref", False))
+        if isinstance(init_first_frame, str):
+            init_first_frame = init_first_frame.lower() in ("true", "1", "yes")
 
         # =====================================================================
         # OUTPUT PARAMETERS
@@ -420,86 +403,117 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             seed = torch.randint(0, 2**32 - 1, (1,)).item()
         seed = int(seed)
 
+        fps = int(job_input.get("fps", 16))
+        offload_model = job_input.get("offload_model", True)
+
         # =====================================================================
         # GENERATE
         # =====================================================================
-        logger.info(f"S2V: {width}x{height}, audio={audio_duration:.2f}s")
-        logger.info(f"num_clip={num_clip}, start_from_ref={start_from_ref}, seed={seed}")
+        logger.info("=" * 60)
+        logger.info("Starting S2V Generation")
+        logger.info(f"  max_area={max_area}")
+        logger.info(f"  infer_frames={infer_frames}, num_repeat={num_repeat}")
+        logger.info(f"  sampling_steps={sampling_steps}, guide_scale={guide_scale}")
+        logger.info(f"  shift={shift}, solver={sample_solver}")
+        logger.info(f"  init_first_frame={init_first_frame}")
+        logger.info(f"  seed={seed}, fps={fps}")
+        logger.info(f"  TTS enabled={enable_tts}")
+        logger.info("=" * 60)
 
         wan_s2v = load_model()
 
-        # Calculate max_area from resolution
-        max_area = width * height
-
-        # TTS parameters - required positional args even when enable_tts=False
-        # If TTS mode was used, audio was already generated above
-        tts_prompt_audio_for_gen = None
-        tts_prompt_text_for_gen = None
-        tts_text_for_gen = None
-
-        # Build generate kwargs
-        generate_kwargs = {
-            "input_prompt": prompt,
-            "ref_image_path": image_path,
-            "audio_path": audio_path,
-            "enable_tts": False,  # TTS already handled above if needed
-            "tts_prompt_audio": tts_prompt_audio_for_gen,
-            "tts_prompt_text": tts_prompt_text_for_gen,
-            "tts_text": tts_text_for_gen,
-            "num_repeat": num_clip,
-            "max_area": max_area,
-            "shift": sample_shift,
-            "sample_solver": sample_solver,
-            "sampling_steps": sample_steps,
-            "guide_scale": sample_guide_scale,
-            "seed": seed,
-            "offload_model": True,
-            "init_first_frame": start_from_ref,
-        }
-
-        if infer_frames is not None:
-            generate_kwargs["infer_frames"] = int(infer_frames)
-
         with torch.inference_mode():
-            video_tensor = wan_s2v.generate(**generate_kwargs)
+            video_tensor = wan_s2v.generate(
+                input_prompt=prompt,
+                ref_image_path=image_path,
+                audio_path=audio_path,
+                enable_tts=enable_tts,
+                tts_prompt_audio=tts_prompt_audio_for_gen,
+                tts_prompt_text=tts_prompt_text_for_gen,
+                tts_text=tts_text,
+                num_repeat=num_repeat,
+                pose_video=pose_video_path,
+                max_area=max_area,
+                infer_frames=infer_frames,
+                shift=shift,
+                sample_solver=sample_solver,
+                sampling_steps=sampling_steps,
+                guide_scale=guide_scale,
+                n_prompt=negative_prompt,
+                seed=seed,
+                offload_model=offload_model,
+                init_first_frame=init_first_frame,
+            )
 
-        # Save video
-        from wan.utils.utils import save_video
+        # =====================================================================
+        # SAVE VIDEO
+        # =====================================================================
+        logger.info("Saving output video...")
+
+        from wan.utils.utils import save_video, merge_video_audio
+
         output_path = tempfile.mktemp(suffix=".mp4")
-        save_video(video_tensor, output_path, fps=fps, audio_path=audio_path)
+
+        # Step 1: Save video without audio
+        save_video(
+            tensor=video_tensor[None],  # Add batch dimension
+            save_file=output_path,
+            fps=fps,
+            nrow=1,
+            normalize=True,
+            value_range=(-1, 1)
+        )
+
+        # Step 2: Merge audio into video
+        # Determine audio path (either user-provided or TTS-generated)
+        if enable_tts:
+            # TTS generates audio to 'tts.wav' in current directory
+            tts_audio_path = "tts.wav"
+            if os.path.exists(tts_audio_path):
+                merge_video_audio(video_path=output_path, audio_path=tts_audio_path)
+                # Clean up TTS audio
+                os.remove(tts_audio_path)
+        elif audio_path:
+            merge_video_audio(video_path=output_path, audio_path=audio_path)
+
         video_base64 = encode_video_base64(output_path)
 
+        # Get actual audio duration after potential TTS
+        if enable_tts and os.path.exists("tts.wav"):
+            audio_duration = get_audio_duration("tts.wav")
+
         # Cleanup
-        os.remove(output_path)
-        os.remove(audio_path)
-        audio_path = None
-        os.remove(image_path)
-        image_path = None
-        if tts_prompt_audio_path:
+        if output_path and os.path.exists(output_path):
+            os.remove(output_path)
+        if audio_path and os.path.exists(audio_path):
+            os.remove(audio_path)
+        if image_path and os.path.exists(image_path):
+            os.remove(image_path)
+        if tts_prompt_audio_path and os.path.exists(tts_prompt_audio_path):
             os.remove(tts_prompt_audio_path)
-            tts_prompt_audio_path = None
+        if pose_video_path and os.path.exists(pose_video_path):
+            os.remove(pose_video_path)
         cleanup()
+
+        logger.info("S2V generation completed successfully!")
 
         return {
             "video": video_base64,
             "format": "mp4",
-            "width": width,
-            "height": height,
-            "num_frames": num_frames,
             "fps": fps,
             "seed": seed,
             "audio_duration": round(audio_duration, 2),
-            "tts_used": tts_used
+            "tts_used": enable_tts
         }
 
     except torch.cuda.OutOfMemoryError as e:
-        for p in [audio_path, image_path, tts_prompt_audio_path]:
+        for p in [audio_path, image_path, tts_prompt_audio_path, pose_video_path, output_path]:
             if p and os.path.exists(p):
                 os.remove(p)
         cleanup()
         return {"error": "Out of GPU memory", "details": str(e)}
     except Exception as e:
-        for p in [audio_path, image_path, tts_prompt_audio_path]:
+        for p in [audio_path, image_path, tts_prompt_audio_path, pose_video_path, output_path]:
             if p and os.path.exists(p):
                 os.remove(p)
         cleanup()
@@ -512,7 +526,11 @@ def concurrency_modifier(current_concurrency: int) -> int:
 
 
 if __name__ == "__main__":
+    logger.info("=" * 60)
     logger.info("Initializing WAN 2.2 S2V Handler...")
+    logger.info("Mode: Speech-to-Video (talking head generation)")
+    logger.info("=" * 60)
+
     try:
         load_model()
     except Exception as e:

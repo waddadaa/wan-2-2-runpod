@@ -18,37 +18,46 @@ Deploy WAN 2.2 video generation models on RunPod Serverless with network volume 
 
 ### Network Volume Structure
 
-Create a RunPod network volume (200GB+ recommended) mounted at `/workspace`:
+Create a RunPod network volume (200GB+ recommended) mounted at `/runpod-volume`:
 
 ```
-/workspace/
-├── Wan2.2/                    # Cloned repository
+/runpod-volume/
 ├── models/
-│   ├── Wan2.2-T2V-A14B/
-│   ├── Wan2.2-TI2V-5B/
-│   ├── Wan2.2-I2V-A14B/
-│   ├── Wan2.2-S2V-14B/
-│   └── Wan2.2-Animate-14B/
-└── env/                       # Python environment (optional)
+│   ├── Wan2.2-T2V-A14B/           # ~50GB (auto-downloaded)
+│   ├── Wan2.2-TI2V-5B/            # ~33GB (auto-downloaded)
+│   ├── Wan2.2-I2V-A14B/           # ~50GB (auto-downloaded)
+│   ├── Wan2.2-S2V-14B/            # ~43GB (auto-downloaded)
+│   ├── Wan2.2-Animate-14B/        # ~50GB (auto-downloaded)
+│   └── preprocess/                # For Animate model
+│       ├── det/yolov10m.onnx          # ~25MB (auto-downloaded)
+│       └── pose2d/vitpose_h_wholebody.onnx  # ~1GB (auto-downloaded)
+└── huggingface-cache/             # HF cache directory
 ```
 
-### Download Models
+### Download Models (Optional)
+
+Models are **auto-downloaded** on first request. To pre-download manually:
 
 ```bash
-# Clone WAN 2.2 repository
-git clone --depth 1 https://github.com/Wan-Video/Wan2.2.git /workspace/Wan2.2
-
 # Download models using huggingface-cli
-huggingface-cli download Wan-AI/Wan2.2-T2V-A14B --local-dir /workspace/models/Wan2.2-T2V-A14B
-huggingface-cli download Wan-AI/Wan2.2-TI2V-5B --local-dir /workspace/models/Wan2.2-TI2V-5B
-huggingface-cli download Wan-AI/Wan2.2-I2V-A14B --local-dir /workspace/models/Wan2.2-I2V-A14B
-huggingface-cli download Wan-AI/Wan2.2-S2V-14B --local-dir /workspace/models/Wan2.2-S2V-14B
-huggingface-cli download Wan-AI/Wan2.2-Animate-14B --local-dir /workspace/models/Wan2.2-Animate-14B
+huggingface-cli download Wan-AI/Wan2.2-T2V-A14B --local-dir /runpod-volume/models/Wan2.2-T2V-A14B
+huggingface-cli download Wan-AI/Wan2.2-TI2V-5B --local-dir /runpod-volume/models/Wan2.2-TI2V-5B
+huggingface-cli download Wan-AI/Wan2.2-I2V-A14B --local-dir /runpod-volume/models/Wan2.2-I2V-A14B
+huggingface-cli download Wan-AI/Wan2.2-S2V-14B --local-dir /runpod-volume/models/Wan2.2-S2V-14B
+huggingface-cli download Wan-AI/Wan2.2-Animate-14B --local-dir /runpod-volume/models/Wan2.2-Animate-14B
 ```
 
-Or use the setup script:
+For Animate preprocessing models (also auto-downloaded):
 ```bash
-./setup_volume.sh
+# YOLOv10m detector
+wget -P /runpod-volume/models/preprocess/det/ \
+  https://huggingface.co/onnx-community/yolov10m/resolve/main/onnx/model.onnx \
+  -O /runpod-volume/models/preprocess/det/yolov10m.onnx
+
+# ViTPose wholebody
+wget -P /runpod-volume/models/preprocess/pose2d/ \
+  https://huggingface.co/wanghaofan/Sonic/resolve/main/vitpose-h-wholebody.onnx \
+  -O /runpod-volume/models/preprocess/pose2d/vitpose_h_wholebody.onnx
 ```
 
 ## Build & Deploy
@@ -82,12 +91,14 @@ docker push YOUR_USERNAME/wan-v2v:latest
 | Setting | Value |
 |---------|-------|
 | Container Image | `YOUR_USERNAME/wan-XXX:latest` |
-| Network Volume | Mount at `/workspace` |
+| Network Volume | Mount at `/runpod-volume` |
 | GPU | A100 80GB (14B models) / RTX 4090 (5B model) |
 | Active Workers | 0 |
 | Max Workers | 1-3 |
 | Idle Timeout | 60s |
 | Execution Timeout | 600s |
+
+> **Note:** Models are auto-downloaded on first request if not present on the network volume.
 
 ---
 
@@ -132,35 +143,71 @@ curl -X POST "https://api.runpod.ai/v2/YOUR_ENDPOINT/run" \
 
 ### TI2V-5B (Text+Image-to-Video)
 
+Dual-mode model supporting both T2V (text-only) and I2V (text+image) generation.
+Smallest model - works on RTX 4090 24GB.
+
 **Required:**
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `prompt` | string | Text description |
-| `image` | string | Base64 encoded input image |
 
-**Optional:**
+**Optional - Mode Selection:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `image` | string | Base64 image. If provided: I2V mode. If omitted: T2V mode |
+
+**Optional - Generation:**
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `size` | string | "832x480" | Resolution |
-| `num_frames` | int | 81 | Frame count |
-| `sample_steps` | int | 50 | Denoising steps |
-| `guidance_scale` | float | 5.0 | CFG scale |
-| `seed` | int | random | Random seed |
-| `fps` | int | 16 | Output FPS |
+| `negative_prompt` | string | from config | What to avoid |
+| `size` | string | "1280x704" | Resolution (720P) |
+| `frame_num` | int | 121 | Frame count (4n+1) |
 
-**Example:**
-```bash
-curl -X POST "https://api.runpod.ai/v2/YOUR_ENDPOINT/run" \
-  -H "Authorization: Bearer YOUR_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "input": {
-      "prompt": "The woman turns and smiles",
-      "image": "<base64_encoded_image>",
-      "size": "832x480",
-      "num_frames": 81
+**Optional - Sampling:**
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `sampling_steps` | int | T2V=50, I2V=40 | Denoising steps (mode-dependent) |
+| `guide_scale` | float | 5.0 | CFG scale |
+| `shift` | float | 5.0 | Flow shift (use 3.0 for 480p) |
+| `sample_solver` | string | "unipc" | Solver: "unipc" or "dpm++" |
+
+**Optional - Output:**
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `seed` | int | random | Random seed |
+| `fps` | int | 24 | Output FPS |
+| `offload_model` | bool | true | Offload to CPU (set false for A100) |
+
+**Example (T2V mode - text only):**
+```python
+response = requests.post(
+    "https://api.runpod.ai/v2/YOUR_ENDPOINT/runsync",
+    headers={"Authorization": "Bearer YOUR_API_KEY"},
+    json={
+        "input": {
+            "prompt": "A cat playing with a ball in a sunny garden",
+            "size": "1280x704",
+            "frame_num": 121,
+            "fps": 24
+        }
     }
-  }'
+)
+```
+
+**Example (I2V mode - with image):**
+```python
+response = requests.post(
+    "https://api.runpod.ai/v2/YOUR_ENDPOINT/runsync",
+    headers={"Authorization": "Bearer YOUR_API_KEY"},
+    json={
+        "input": {
+            "prompt": "The woman turns and smiles",
+            "image": "<base64_encoded_image>",
+            "size": "1280x704",
+            "frame_num": 121
+        }
+    }
+)
 ```
 
 ---
@@ -187,76 +234,186 @@ curl -X POST "https://api.runpod.ai/v2/YOUR_ENDPOINT/run" \
 
 ### S2V (Speech-to-Video)
 
+Generates talking head videos with lip-sync from audio or text-to-speech.
+
 **Required:**
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `image` | string | Base64 face image (frontal recommended) |
-| `audio` | string | Base64 audio file (WAV/MP3) |
 
-**Or for TTS mode:**
+**Audio Input (Option A: Pre-recorded):**
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `image` | string | Base64 face image |
+| `audio` | string | Base64 audio file (WAV/MP3/FLAC) |
+
+**Audio Input (Option B: Text-to-Speech):**
+| Parameter | Type | Description |
+|-----------|------|-------------|
 | `enable_tts` | bool | Set to `true` |
 | `tts_text` | string | Text to synthesize |
+| `tts_prompt_audio` | string | (Optional) Base64 voice sample for cloning |
+| `tts_prompt_text` | string | (Optional) Transcription of voice sample |
 
-**Optional:**
+> **Note:** TTS uses CosyVoice2, downloaded on first use (~1GB).
+
+**Optional - Generation:**
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `prompt` | string | "" | Additional guidance |
-| `size` | string | "1280x720" | Resolution |
-| `num_frames` | int | auto | Auto from audio duration |
-| `sample_steps` | int | 50 | Denoising steps |
-| `guidance_scale` | float | 5.0 | CFG scale |
-| `num_clip` | int | 1 | Clips for long audio |
-| `start_from_ref` | bool | true | Use ref as first frame |
-| `seed` | int | random | Random seed |
-| `fps` | int | 24 | Output FPS (24 for lip sync) |
+| `prompt` | string | "" | Style guidance |
+| `negative_prompt` | string | from config | What to avoid |
+| `max_area` | int | 921600 | Max pixel area (1280x720) |
 
-**Example:**
-```bash
-curl -X POST "https://api.runpod.ai/v2/YOUR_ENDPOINT/run" \
-  -H "Authorization: Bearer YOUR_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "input": {
-      "image": "<base64_face_image>",
-      "audio": "<base64_audio>",
-      "prompt": "Professional speaker",
-      "size": "1280x720",
-      "fps": 24
+**Optional - Sampling:**
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `sampling_steps` | int | 40 | Denoising steps |
+| `guide_scale` | float | 4.5 | CFG scale |
+| `shift` | float | 3.0 | Flow matching shift |
+| `sample_solver` | string | "unipc" | Solver: "unipc" or "dpm++" |
+
+**Optional - S2V Specific:**
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `num_repeat` | int | auto | Clips for long audio |
+| `infer_frames` | int | 80 | Frames per clip (must be 4n) |
+| `init_first_frame` | bool | false | Use ref as exact first frame |
+| `pose_video` | string | null | Base64 pose video for pose-driven generation |
+
+**Optional - Output:**
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `seed` | int | random | Random seed |
+| `fps` | int | 16 | Output FPS |
+| `offload_model` | bool | true | Offload to CPU after generation |
+
+**Example (Audio mode):**
+```python
+import base64
+import requests
+
+with open("face.png", "rb") as f:
+    image = base64.b64encode(f.read()).decode()
+with open("speech.wav", "rb") as f:
+    audio = base64.b64encode(f.read()).decode()
+
+response = requests.post(
+    "https://api.runpod.ai/v2/YOUR_ENDPOINT/runsync",
+    headers={"Authorization": "Bearer YOUR_API_KEY"},
+    json={
+        "input": {
+            "image": image,
+            "audio": audio,
+            "sampling_steps": 40,
+            "guide_scale": 4.5
+        }
     }
-  }'
+)
+```
+
+**Example (TTS mode):**
+```python
+response = requests.post(
+    "https://api.runpod.ai/v2/YOUR_ENDPOINT/runsync",
+    headers={"Authorization": "Bearer YOUR_API_KEY"},
+    json={
+        "input": {
+            "image": image,
+            "enable_tts": True,
+            "tts_text": "Hello, this is a test of the speech to video system.",
+            "sampling_steps": 40
+        }
+    }
+)
 ```
 
 ---
 
-### V2V/Animate (Video-to-Video)
+### Animate (Motion Transfer)
+
+Transfers motion from a driving video to a reference image character.
+
+```
+INPUT:
+├── reference_image.png   → Person A (the appearance you want)
+└── driving_video.mp4     → Person B moving (the motion you want)
+
+OUTPUT:
+└── output.mp4            → Person A doing Person B's movements
+```
 
 **Required:**
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `video` | string | Base64 source video |
+| `reference_image` | string | Base64 encoded image (character appearance) |
+| `driving_video` | string | Base64 encoded video (motion source) |
 
-**Optional:**
+**Optional - Preprocessing:**
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `reference_image` | string | null | Base64 character image |
-| `prompt` | string | "" | Output description |
-| `size` | string | "1280x720" | Resolution |
-| `num_frames` | int | 81 | Frame count |
-| `sample_steps` | int | 50 | Denoising steps |
-| `guidance_scale` | float | 5.0 | CFG scale |
-| `refert_num` | int | 1 | Temporal guidance (1 or 5) |
-| `replace_flag` | bool | false | Character replacement mode |
-| `use_relighting_lora` | bool | false | Relighting LoRA |
-| `seed` | int | random | Random seed |
-| `fps` | int | 16 | Output FPS |
+| `resolution` | list | [1280, 720] | Output resolution [width, height] |
+| `fps` | int | 30 | Frames per second |
+| `retarget_flag` | bool | false | Enable pose retargeting for different body proportions |
+
+**Optional - Generation:**
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `prompt` | string | "" | Text description (minimal effect) |
+| `negative_prompt` | string | "" | What to avoid |
+| `clip_len` | int | 77 | Frames per clip (must be 4n+1) |
+| `refert_num` | int | 1 | Temporal guidance frames (1 or 5) |
+| `sampling_steps` | int | 20 | Denoising steps |
+| `guide_scale` | float | 1.0 | CFG scale |
+| `shift` | float | 5.0 | Flow matching shift |
+| `sample_solver` | string | "dpm++" | Solver: "dpm++" or "unipc" |
+| `seed` | int | random | Random seed (-1 for random) |
+| `offload_model` | bool | true | Offload to CPU to save VRAM |
+
+> **Note:** `use_relighting_lora` is always enabled for better lighting quality.
+
+**Example:**
+```python
+import base64
+import requests
+
+# Encode files
+with open("person.png", "rb") as f:
+    ref_image = base64.b64encode(f.read()).decode()
+with open("dance.mp4", "rb") as f:
+    drive_video = base64.b64encode(f.read()).decode()
+
+response = requests.post(
+    "https://api.runpod.ai/v2/YOUR_ENDPOINT/runsync",
+    headers={"Authorization": "Bearer YOUR_API_KEY"},
+    json={
+        "input": {
+            "reference_image": ref_image,
+            "driving_video": drive_video,
+            "resolution": [1280, 720],
+            "fps": 30,
+            "retarget_flag": False
+        }
+    }
+)
+
+# Save output
+result = response.json()
+video_bytes = base64.b64decode(result["output"]["video"])
+with open("output.mp4", "wb") as f:
+    f.write(video_bytes)
+```
+
+**When to use `retarget_flag`:**
+| Scenario | retarget_flag |
+|----------|---------------|
+| Same body proportions | `false` |
+| Different body sizes (tall/short) | `true` |
+| Different body types | `true` |
 
 ---
 
 ## Response Format
 
+**T2V / I2V:**
 ```json
 {
   "video": "<base64_encoded_mp4>",
@@ -265,8 +422,44 @@ curl -X POST "https://api.runpod.ai/v2/YOUR_ENDPOINT/run" \
   "height": 720,
   "num_frames": 81,
   "fps": 16,
+  "seed": 12345
+}
+```
+
+**TI2V-5B:**
+```json
+{
+  "video": "<base64_encoded_mp4>",
+  "format": "mp4",
+  "width": 1280,
+  "height": 704,
+  "frame_num": 121,
+  "fps": 24,
   "seed": 12345,
-  "model": "Wan2.2-T2V-A14B"
+  "mode": "T2V" or "I2V"
+}
+```
+
+**S2V:**
+```json
+{
+  "video": "<base64_encoded_mp4>",
+  "format": "mp4",
+  "fps": 16,
+  "seed": 12345,
+  "audio_duration": 5.0,
+  "tts_used": false
+}
+```
+
+**Animate:**
+```json
+{
+  "video": "<base64_encoded_mp4>",
+  "format": "mp4",
+  "resolution": [1280, 720],
+  "fps": 30,
+  "seed": 12345
 }
 ```
 

@@ -47,8 +47,12 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir --no-build-isolation flash_attn==2.8.3
 
-# Install additional preprocessing dependencies
-RUN pip install --no-cache-dir moviepy==1.0.3
+# Install additional preprocessing dependencies for Animate
+# sam2 is required for segmentation in preprocessing
+# moviepy for video editing
+RUN pip install --no-cache-dir \
+    moviepy==1.0.3 \
+    sam2
 
 # Copy handler
 COPY handler_v2v.py handler.py

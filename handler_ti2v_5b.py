@@ -254,7 +254,15 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
         from wan.utils.utils import save_video
         output_path = tempfile.mktemp(suffix=".mp4")
-        save_video(video_tensor, output_path, fps=fps)
+        # Add batch dimension [None] as expected by save_video
+        save_video(
+            tensor=video_tensor[None],
+            save_file=output_path,
+            fps=fps,
+            nrow=1,
+            normalize=True,
+            value_range=(-1, 1)
+        )
 
         video_base64 = encode_video_base64(output_path)
         os.remove(output_path)

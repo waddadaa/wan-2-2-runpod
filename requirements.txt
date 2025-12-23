@@ -1,8 +1,7 @@
 # WAN 2.2 Requirements
 # Compatible with runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 
-# Core ML (torch must be installed before flash_attn)
-torch>=2.4.0
+# Core ML (base image has torch 2.4.0)
 numpy==1.26.4
 scipy==1.16.3
 scikit-learn==1.8.0
@@ -18,8 +17,7 @@ safetensors==0.7.0
 huggingface-hub==0.36.0
 peft==0.14.0
 
-# Flash Attention
-flash_attn==2.8.3
+# Flash Attention - installed separately in Dockerfile with --no-build-isolation
 
 # Video/Image Processing
 opencv-python==4.11.0.86

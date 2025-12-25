@@ -137,12 +137,6 @@ def encode_video_base64(video_path: str) -> str:
         return base64.b64encode(f.read()).decode("utf-8")
 
 
-def save_temp_file(data: bytes, suffix: str) -> str:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-        f.write(data)
-        return f.name
-
-
 def parse_resolution(size: str) -> tuple:
     if not size:
         return (1280, 720)
@@ -155,9 +149,10 @@ def parse_resolution(size: str) -> tuple:
     return (int(parts[0]), int(parts[1]))
 
 
-def get_image_dimensions(image_bytes: bytes) -> tuple:
-    img = Image.open(BytesIO(image_bytes))
-    return img.size
+def load_image_from_bytes(image_bytes: bytes) -> Image.Image:
+    """Load PIL Image from bytes and return it with dimensions."""
+    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    return img
 
 
 def cleanup():
@@ -259,7 +254,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     }
     """
     job_input = job.get("input", {})
-    image_path = None
 
     try:
         # =====================================================================
@@ -270,8 +264,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             return {"error": "image is required (base64 encoded)"}
 
         image_bytes = decode_base64_data(image_data)
-        input_width, input_height = get_image_dimensions(image_bytes)
-        image_path = save_temp_file(image_bytes, ".png")
+        img = load_image_from_bytes(image_bytes)
+        input_width, input_height = img.size
 
         # =====================================================================
         # GENERATION PARAMETERS
@@ -283,8 +277,10 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             "static, no motion, frozen, ugly, bad anatomy, deformed"
         )
 
-        size = job_input.get("size", "1280x720")
+        # For I2V, we use max_area - the output follows input image aspect ratio
+        size = job_input.get("size", "1280*720")
         width, height = parse_resolution(size)
+        max_area = width * height
 
         num_frames = job_input.get("num_frames", job_input.get("frame_num", 81))
         num_frames = int(num_frames)
@@ -321,8 +317,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         # =====================================================================
         # GENERATE
         # =====================================================================
-        generator = torch.Generator(device="cuda").manual_seed(seed)
-
         logger.info(f"I2V: {width}x{height}, {num_frames}f, input={input_width}x{input_height}")
         logger.info(f"Sampling: steps={sample_steps}, cfg={sample_guide_scale}, shift={sample_shift}")
 
@@ -332,48 +326,69 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         extended_prompt = None
         if use_prompt_extend:
             try:
-                from wan.utils.prompt_extend import extend_prompt_vl
-                extended_prompt = extend_prompt_vl(
-                    image_path,
-                    prompt,
-                    model=prompt_extend_model,
-                    method=prompt_extend_method,
-                    target_lang=prompt_extend_target_lang
+                from wan.utils.prompt_extend import QwenPromptExpander
+                prompt_expander = QwenPromptExpander(
+                    model_name=prompt_extend_model,
+                    task="i2v-A14B",
+                    is_vl=True,
+                    device=0
                 )
-                logger.info(f"Extended: {extended_prompt[:100]}...")
+                prompt_output = prompt_expander(
+                    prompt,
+                    image=img,
+                    tar_lang=prompt_extend_target_lang,
+                    seed=seed
+                )
+                if prompt_output.status:
+                    extended_prompt = prompt_output.prompt
+                    logger.info(f"Extended: {extended_prompt[:100]}...")
+                else:
+                    logger.warning(f"Prompt extension failed: {prompt_output.message}")
             except Exception as e:
                 logger.warning(f"Prompt extension failed: {e}")
 
         final_prompt = extended_prompt if extended_prompt else prompt
 
         with torch.inference_mode():
-            output = pipeline(
-                image=image_path,
-                prompt=final_prompt,
-                negative_prompt=negative_prompt,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                guidance_scale=sample_guide_scale,
-                num_inference_steps=sample_steps,
-                generator=generator,
-                flow_shift=sample_shift
+            video = pipeline.generate(
+                final_prompt,
+                img,
+                max_area=max_area,
+                frame_num=num_frames,
+                shift=sample_shift,
+                sample_solver=sample_solver,
+                sampling_steps=sample_steps,
+                guide_scale=sample_guide_scale,
+                n_prompt=negative_prompt,
+                seed=seed,
+                offload_model=True
             )
 
         output_path = tempfile.mktemp(suffix=".mp4")
-        output.save(output_path, fps=fps)
+        from wan.utils.utils import save_video
+        save_video(
+            tensor=video[None],
+            save_file=output_path,
+            fps=fps,
+            nrow=1,
+            normalize=True,
+            value_range=(-1, 1)
+        )
         video_base64 = encode_video_base64(output_path)
 
+        # Calculate actual output dimensions (follows input aspect ratio)
+        aspect_ratio = input_height / input_width
+        out_height = int(round((max_area * aspect_ratio) ** 0.5))
+        out_width = int(round(max_area / out_height))
+
         os.remove(output_path)
-        os.remove(image_path)
-        image_path = None
         cleanup()
 
         result = {
             "video": video_base64,
             "format": "mp4",
-            "width": width,
-            "height": height,
+            "width": out_width,
+            "height": out_height,
             "num_frames": num_frames,
             "fps": fps,
             "seed": seed,
@@ -386,13 +401,9 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         return result
 
     except torch.cuda.OutOfMemoryError as e:
-        if image_path and os.path.exists(image_path):
-            os.remove(image_path)
         cleanup()
         return {"error": "Out of GPU memory", "details": str(e)}
     except Exception as e:
-        if image_path and os.path.exists(image_path):
-            os.remove(image_path)
         cleanup()
         traceback.print_exc()
         return {"error": str(e), "traceback": traceback.format_exc()}
